@@ -54,7 +54,9 @@ with plt.style.context(spstyle.get_style('nature-reviews')):
 ax.set_title('Nature reviews style')
 ```
 
+
 ![basic style](./figures/basic_nature_reviews_scatter.png)
+
 
 ### Modifying figure properties 
 
@@ -75,7 +77,9 @@ ax.set_title('Nature reviews style with bells and whistles')
 ```
 
 
-![basic style](./figures/full_nature_reviews_scatter.png)
+
+![advanced nature reviews style](./figures/full_nature_reviews_scatter.png)
+
 
 
 

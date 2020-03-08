@@ -1,6 +1,6 @@
 NAME=sciplotlib
-VERSION=0.0.1
+VERSION=0.0.5
 AUTHOR="Timothy Sit"
 AUTHOR_EMAIL="sitpakhang@gmail.com"
 DESCRIPTION="Custom functions to improve the look of matplotlib plots for scientific visualisation."
-URL="https://github.com/Timothysit"
+URL="https://github.com/Timothysit/sciplotlib"

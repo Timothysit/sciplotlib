@@ -1,2 +1,2 @@
 recursive-include . variables
-include sciplotlib/stylesheets/*.mpl
+include sciplotlib/stylesheets/*.mplstyle

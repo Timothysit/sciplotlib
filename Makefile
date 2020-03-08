@@ -72,23 +72,23 @@ endif
 module: 
 	@# ensure there is a symlink from MODULE_NAME to module directory
 	@# then run regular setup.py to build the module
-	$(RUN_DOCK) "cd ~/$(MODULE_NAME) \
+	$(RUN_DOCK) "cd $(MODULE_NAME) \
 		&& find ./ -type l -maxdepth 1 |xargs rm -f \
 		&& ln -sf module "$(MODULE_NAME)" \
 		&& python3 setup.py sdist"
 
 .PHONY: pylint
 pylint:
-	$(RUN_DOCK) "cd ~/$(MODULE_NAME)/module \
+	$(RUN_DOCK) "cd $(MODULE_NAME)/module \
 		&& pylint --rcfile=../.pylintrc * -f parseable"
 
 .PHONY: upload
 upload:
-	$(RUN_DOCK) "twine upload ~/$(MODULE_NAME)/dist/$(MODULE_NAME)-$(MODULE_VERSION)*"
+	$(RUN_DOCK) "twine upload $(MODULE_NAME)/dist/$(MODULE_NAME)-$(MODULE_VERSION)*"
 
 .PHONY: clean
 clean:
-	$(RUN_DOCK) "cd ~/$(MODULE_NAME) \
+	$(RUN_DOCK) "cd $(MODULE_NAME) \
 		&& rm -rf ./build ./dist ./*.egg-info \
 		&& find ./ -type l -maxdepth 1 |xargs rm -f \
 		&& find ./$(MODULE) -type d -name '__pycache__' |xargs rm -rf"

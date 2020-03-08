@@ -1,0 +1,29 @@
+version: "3.4"
+services:
+  pyshipper:
+    # Makefile fills PROJECT_NAME to current directory name.
+    # add UID to allow multiple users run this in parallel
+    container_name: ${MODULE_NAME}_${HOST_UID:-4000}
+    hostname: ${MODULE_NAME}
+    # These variables are passed into the container.
+    environment:
+      - UID=${HOST_UID:-4000}
+      - PROJECT_PATH=/home/${HOST_USER:-nodummy}/${MODULE_NAME}
+      - MODULE_NAME=${MODULE_NAME}
+    # Run with user priviliges by default.
+    user: ${HOST_USER:-nodummy}
+    image: ${MODULE_NAME}:${HOST_USER:-nodummy}
+    build:
+      context: .
+      # Build for current user.
+      target: user
+      dockerfile: Dockerfile
+      # These variables are passed to Dockerfile.
+      args:
+        - HOST_UID=${HOST_UID:-4000}
+        - HOST_USER=${HOST_USER:-nodummy}
+    # Run container as a service. Replace with something useful.
+    command: ["tail", "-f", "/dev/null"]
+    tty: true
+    volumes:
+      - ${PWD:-.}:/home/${HOST_USER:-nodummy}/${MODULE_NAME}

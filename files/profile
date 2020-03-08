@@ -1,0 +1,8 @@
+# export vars to environment
+if [ -s ~/${MODULE_NAME}/variables ]; then
+    set -a
+    . ~/${MODULE_NAME}/variables
+    set +a
+fi
+
+

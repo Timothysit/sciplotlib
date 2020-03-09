@@ -82,8 +82,6 @@ ax.set_title('Nature reviews style with bells and whistles')
 
 
 
-
-
 ## Installation 
 
 Simply do 
@@ -111,5 +109,29 @@ Do contact me if you are interested in adding new functions or templates to this
 
 
 
+## Other fun stuff 
+
+I am also including other aesthetically pleasing plot styles that are non-academic. For example, to create plots from The Economist, do: 
+
+
+```python 
+import numpy as np
+import matplotlib.pyplot as plt
+from sciplotlib import style as spstyle
+from sciplotlib import misc as spmis
+
+
+with plt.style.context(spstyle.get_style('economist')):
+    fig, ax = plt.subplots()
+    ax.scatter(x, y)
+    ax.text(0, 1.2, 'Main title', weight='bold', size=13, transform=ax.transAxes)
+    ax.text(0, 1.1, 'This is the usual long subtitle', transform=ax.transAxes)
+    fig, ax = spmisc.add_economist_rectangle(fig, ax, xloc=0.125, yloc=1.1, width=0.05, height=0.02)
+    fig, ax = spmisc.add_datasource(fig, ax, s='Source: IMF', xloc=0.125, yloc=0, alpha=0.6)
+
+```
+
+
+![economist advanced style](./figures/economist-scatter.png)
 
 

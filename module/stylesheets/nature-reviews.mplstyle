@@ -104,7 +104,7 @@ hatch.color     : black
 hatch.linewidth : 1
 
 #### Boxplot
-#boxplot.notch       : False
+boxplot.notch       : False
 #boxplot.vertical    : True
 #boxplot.whiskers    : 1.5
 # boxplot.bootstrap   : None

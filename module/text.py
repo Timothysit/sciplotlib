@@ -1,6 +1,7 @@
 import string
 import numpy as np
 
+
 def add_lettering(axs, size=10, xloc=-0.1, yloc=1.1, weight='bold'):
     """
     Add lettering to each subplot

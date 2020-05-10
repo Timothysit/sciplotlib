@@ -86,7 +86,7 @@ def use_sans_maths(return_type='permenant', fig=None, ax=None, verbose=False):
 
         return fig, ax
 
-def get_colorscheme(name='nature-reviews', output_type='hex'):
+def get_palette(name='nature-reviews', output_type='hex'):
     """
     Gets the list of colors for a particular color scheme.
     Some colorschemes are obtained from the ggsci project in R:

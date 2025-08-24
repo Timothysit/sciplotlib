@@ -293,6 +293,11 @@ class FigureLayoutApp(ttk.Window):
         super().__init__(themename='lumen')
         self.title("Figure Layout GUI")
         self.geometry("1300x1300")
+        self.dpi = dpi 
+
+        # Initial figure size 
+        self.paper_width_cm = 0
+        self.paper_height_cm = 0
 
 
         # Grid layout
@@ -345,6 +350,32 @@ class FigureLayoutApp(ttk.Window):
 
         ttk.Button(control_panel, text="Update Grid", command=self.update_grid).pack(pady=(10, 0), fill="x")
 
+        # Paper Size Controls
+        ttk.Separator(control_panel, orient='horizontal').pack(fill='x', pady=10)
+
+        ttk.Label(control_panel, text="Paper Size").pack(anchor="w")
+        self.paper_size_var = tk.StringVar(value='a4')
+        paper_sizes = ['a4', 'a4_half_portrait', 'a0_portrait', 'a0_landscape', '16:9_monitor', 'custom']
+        self.paper_size_combo = ttk.Combobox(control_panel, textvariable=self.paper_size_var, values=paper_sizes)
+        self.paper_size_combo.pack(fill="x", pady=(0, 10))
+        self.paper_size_combo.bind("<<ComboboxSelected>>", self._on_paper_size_change)
+
+        # Frame for custom size entries
+        self.custom_size_frame = ttk.Frame(control_panel)
+        self.custom_size_frame.pack(fill='x')
+
+        ttk.Label(self.custom_size_frame, text="Width (cm)").grid(row=0, column=0, sticky='w')
+        self.custom_width_var = tk.DoubleVar(value=21.0)
+        ttk.Entry(self.custom_size_frame, textvariable=self.custom_width_var).grid(row=0, column=1, padx=5)
+
+        ttk.Label(self.custom_size_frame, text="Height (cm)").grid(row=1, column=0, sticky='w')
+        self.custom_height_var = tk.DoubleVar(value=29.7)
+        ttk.Entry(self.custom_size_frame, textvariable=self.custom_height_var).grid(row=1, column=1, padx=5)
+        
+        # Add a button to apply the new paper size
+        self.update_paper_button = ttk.Button(control_panel, text="Update Paper Size", command=self.update_paper_size)
+        self.update_paper_button.pack(pady=(10, 0), fill="x")
+
 
         # Right side: Control Panel : Style controls
         style_panel = ttk.LabelFrame(right_column_frame, text="Style", padding=10)
@@ -376,6 +407,15 @@ class FigureLayoutApp(ttk.Window):
 
 
         ########################### MAKE THE PAPER PAGE ######################################
+        self.panels = []  # set empty panels for now 
+        # Create an empty rectangle first
+        self.paper_rect = self.canvas.create_rectangle(0, 0, 0, 0, fill="white", outline="black", width=2)
+
+        # Set the initial state and draw the paper
+        self.update_paper_size()
+        self._on_paper_size_change()
+
+        """
         paper_width_px = cm_to_px(PAPER_WIDTH_CM, dpi)
         paper_height_px = cm_to_px(PAPER_HEIGHT_CM, dpi)
 
@@ -395,9 +435,8 @@ class FigureLayoutApp(ttk.Window):
         # Draw grid layout
         self.draw_grid((offset_x, offset_y, offset_x + paper_width_px, offset_y + paper_height_px),
                        self.grid_rows, self.grid_cols)
+        """
 
-
-        self.panels = []
 
     """
     def add_panel(self):
@@ -473,28 +512,120 @@ class FigureLayoutApp(ttk.Window):
 
             # Optionally: update existing panels to snap to the new grid
             for panel in self.panels:
+                 # 1. Update the panel's internal knowledge of the grid
                 panel.nrows = self.grid_rows
                 panel.ncols = self.grid_cols
                 panel.paper_bbox = self.canvas.coords(self.paper_rect)
-                panel.canvas.delete(panel.rect)
-                panel.canvas.delete(panel.label_id)
-                panel.rect, panel.label_id = panel._draw_panel()
-                panel._bind_events()
+
+                # 2. Get current position and calculate the new snapped position
+                x0, y0, x1, y1 = panel.get_bbox()
+                nx0, ny0 = panel.snap_to_grid(x0, y0)
+                nx1, ny1 = panel.snap_to_grid(x1, y1)
+
+                # 3. Move the existing panel items to the new snapped coordinates
+                panel.canvas.coords(panel.rect, nx0, ny0, nx1, ny1)
+                panel.canvas.coords(panel.label_id, nx0 + 6, ny0 + 6)
+                if panel.file_label_id:
+                    cx = (nx0 + nx1) / 2
+                    cy = (ny0 + ny1) / 2
+                    panel.canvas.coords(panel.file_label_id, cx, cy)
+                
+                # panel.canvas.delete(panel.rect)
+                # panel.canvas.delete(panel.label_id)
+                # panel.rect, panel.label_id = panel._draw_panel()
+                # panel._bind_events()
 
         except Exception as e:
             print("Invalid grid dimensions:", e)
+    
+    def _on_paper_size_change(self, event=None):
+        """Enables or disables the custom size entry fields based on dropdown selection."""
+        if self.paper_size_var.get() == 'custom':
+            for child in self.custom_size_frame.winfo_children():
+                child.configure(state='normal')
+        else:
+            for child in self.custom_size_frame.winfo_children():
+                child.configure(state='disabled')
+
+    def update_paper_size(self):
+        """Resizes the paper rectangle on the canvas based on the selected size."""
+        # Dictionary of preset dimensions in cm (width, height)
+        PAPER_DIMENSIONS = {
+            'a4': (21.0, 29.7),
+            'a4_half_portrait': (10.5, 29.7),
+            'a0_portrait': (84.1, 118.9),
+            'a0_landscape': (118.9, 84.1),
+            '16:9_monitor': (59.7, 33.6),  # For a 27-inch monitor
+        }
+
+        selection = self.paper_size_var.get()
+
+        if selection == 'custom':
+            paper_width_cm = self.custom_width_var.get()
+            paper_height_cm = self.custom_height_var.get()
+        else:
+            paper_width_cm, paper_height_cm = PAPER_DIMENSIONS[selection]
+            self.custom_width_var.set(paper_width_cm)
+            self.custom_height_var.set(paper_height_cm)
+        
+        # Store the true dimensions for the final figure export
+        self.paper_width_cm = paper_width_cm
+        self.paper_height_cm = paper_height_cm
+
+        # --- SCALING LOGIC ---
+        # 1. Calculate the paper's true pixel size
+        true_width_px = cm_to_px(self.paper_width_cm, self.dpi)
+        true_height_px = cm_to_px(self.paper_height_cm, self.dpi)
+
+        # 2. Define the available drawing area on the canvas
+        offset_x = 50
+        offset_y = 50
+        canvas_area_w = self.canvas.winfo_width() - (2 * offset_x)
+        canvas_area_h = self.canvas.winfo_height() - (2 * offset_y)
+        
+        if canvas_area_w <= 1: # Fallback if canvas not drawn yet
+            canvas_area_w = 800 - (2 * offset_x)
+            canvas_area_h = 1300 - (2 * offset_y)
+        
+        # 3. Calculate the scale factor to fit the paper in the area
+        scale = 1.0
+        if true_width_px > canvas_area_w or true_height_px > canvas_area_h:
+            scale_w = canvas_area_w / true_width_px
+            scale_h = canvas_area_h / true_height_px
+            scale = min(scale_w, scale_h)
+
+        # 4. Calculate the scaled display size
+        display_width_px = true_width_px * scale
+        display_height_px = true_height_px * scale
+        
+        # 5. Resize the paper rectangle on the canvas using the display size
+        self.canvas.coords(
+            self.paper_rect,
+            offset_x,
+            offset_y,
+            offset_x + display_width_px,
+            offset_y + display_height_px
+        )
+
+        # Update the grid to match the new size
+        self.update_grid()
+        
+        # Also update the paper_bbox for all existing panels
+        for panel in self.panels:
+            panel.paper_bbox = self.canvas.coords(self.paper_rect)
 
 
     def make_figures(self):
         style_name = self.stylesheet_var.get()
 
-        fig_width = self.canvas.bbox(self.paper_rect)[2] - self.canvas.bbox(self.paper_rect)[0]
-        fig_height = self.canvas.bbox(self.paper_rect)[3] - self.canvas.bbox(self.paper_rect)[1]
+        # Use the stored true dimensions (in inches) for the final figure, not the canvas preview size.
+        fig_width_in = self.paper_width_cm / 2.54
+        fig_height_in = self.paper_height_cm / 2.54
 
-        dpi = 100  # You can use self.dpi if you store it
+        output_dpi = 300
 
         with plt.style.context(splstyle.get_style(style_name)):
-            fig = plt.figure(figsize=(fig_width / dpi, fig_height / dpi), dpi=dpi)
+            fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=output_dpi)
 
             # Use GridSpec for layout
             from matplotlib.gridspec import GridSpec

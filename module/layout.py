@@ -27,6 +27,8 @@ from matplotlib.text import Text
 # Sciplotlib
 import sciplotlib.style as splstyle
 
+# For saving
+import json
 
 import pdb
 from copy import copy
@@ -293,6 +295,10 @@ class FigureLayoutApp(ttk.Window):
         super().__init__(themename='lumen')
         self.title("Figure Layout GUI")
         self.geometry("1300x1300")
+
+        # Quite app when window is closed
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
         self.dpi = dpi 
 
         # Initial figure size 
@@ -338,8 +344,31 @@ class FigureLayoutApp(ttk.Window):
         self.save_button = ttk.Button(control_panel, text="Save Layout", command=self.save_layout)
         self.save_button.pack(pady=(0, 10), fill="x")
 
+        self.load_button = ttk.Button(control_panel, text="Load Layout", command=self.load_layout)
+        self.load_button.pack(pady=(0, 10), fill="x")
+
         self.make_button = ttk.Button(control_panel, text="Make Figures", command=self.make_figures)
         self.make_button.pack(pady=(10, 0), fill="x")
+
+        # --- SAVE FIGURE CONTROLS ---
+        save_frame = ttk.LabelFrame(control_panel, text="Save Options", padding=5)
+        save_frame.pack(fill='x', pady=(15, 0))
+
+        ttk.Label(save_frame, text="Save Path").pack(anchor="w")
+
+        path_entry_frame = ttk.Frame(save_frame)
+        path_entry_frame.pack(fill='x', expand=True)
+
+        self.save_path_var = tk.StringVar()
+        # Set the default path to ~/composed_layout
+        default_save_path = Path.home() / "composed_layout"
+        self.save_path_var.set(str(default_save_path))
+
+        save_entry = ttk.Entry(path_entry_frame, textvariable=self.save_path_var)
+        save_entry.pack(side='left', fill='x', expand=True)
+
+        browse_button = ttk.Button(path_entry_frame, text="...", command=self._browse_save_path, width=3)
+        browse_button.pack(side='right', padx=(5, 0))
 
         # Grid customisation
         ttk.Label(control_panel, text="Grid Rows").pack(anchor="w")
@@ -392,7 +421,7 @@ class FigureLayoutApp(ttk.Window):
         # 2. Font Dropdown
         ttk.Label(style_panel, text="Font").pack(anchor="w")
         self.font_var = tk.StringVar(value="Helvetica")
-        ttk.Combobox(style_panel, textvariable=self.font_var, values=["Helvetica", "Computer Modern Sans Serif"]).pack(
+        ttk.Combobox(style_panel, textvariable=self.font_var, values=["Helvetica", "Computer Modern Sans Serif", "Comic Sans MS"]).pack(
             fill="x", pady=(0, 10))
 
         # 3. Font Size (float entry)
@@ -405,6 +434,10 @@ class FigureLayoutApp(ttk.Window):
         self.tick_font_size_var = tk.DoubleVar(value=9.0)
         ttk.Entry(style_panel, textvariable=self.tick_font_size_var).pack(fill="x")
 
+        # 5. Capital or small letters
+        self.use_capital_letters_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(style_panel, text="Use Capital Letters", variable=self.use_capital_letters_var,
+                        command=self._update_panel_labels).pack(anchor="w", pady=(0, 10))
 
         ########################### MAKE THE PAPER PAGE ######################################
         self.panels = []  # set empty panels for now 
@@ -461,7 +494,13 @@ class FigureLayoutApp(ttk.Window):
 
     def add_panel(self):
 
-        label = chr(ord('A') + len(self.panels))
+        # Determine the base character ('A' or 'a') from the checkbutton state
+        if self.use_capital_letters_var.get():
+            base_char = 'A'
+        else:
+            base_char = 'a'
+
+        label = chr(ord(base_char) + len(self.panels))
         x0, y0, x1, y1 = self.canvas.coords(self.paper_rect)
         panel = ResizablePanel(self.canvas, x0 + 50, y0 + 50, 200, 150,
                                label=label,
@@ -470,10 +509,130 @@ class FigureLayoutApp(ttk.Window):
                                paper_bbox=self.canvas.coords(self.paper_rect))
         self.panels.append(panel)
 
+    def _update_panel_labels(self):
+        """Updates the lettering case for all existing panels."""
+        if self.use_capital_letters_var.get():
+            base_char = 'A'
+        else:
+            base_char = 'a'
+
+        for i, panel in enumerate(self.panels):
+            new_label = chr(ord(base_char) + i)
+            # Update the panel's internal text property
+            panel.label_text = new_label
+            # Update the text displayed on the canvas
+            self.canvas.itemconfig(panel.label_id, text=new_label)
+
 
     def save_layout(self):
+        """Gathers the current layout state and saves it to a JSON file."""
+        filepath = filedialog.asksaveasfilename(
+            title="Save Layout File",
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return  # User cancelled
 
-        return None
+        # 1. Gather all the data into a dictionary
+        layout_data = {
+            'grid_settings': {
+                'rows': self.grid_rows_var.get(),
+                'cols': self.grid_cols_var.get()
+            },
+            'paper_settings': {
+                'size_name': self.paper_size_var.get(),
+                'custom_width_cm': self.custom_width_var.get(),
+                'custom_height_cm': self.custom_height_var.get()
+            },
+            'panels': []
+        }
+
+        for panel in self.panels:
+            panel_info = {
+                'label': panel.label_text,
+                'bbox': panel.get_bbox(),  # [x0, y0, x1, y1]
+                'filepath': getattr(panel, 'filepath', None)
+            }
+            layout_data['panels'].append(panel_info)
+
+        # 2. Write the data to the JSON file
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(layout_data, f, indent=4)
+            print(f"Layout saved successfully to {filepath}")
+        except Exception as e:
+            print(f"Error saving layout: {e}")
+
+    def load_layout(self):
+        """Loads a layout state from a JSON file."""
+        filepath = filedialog.askopenfilename(
+            title="Open Layout File",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return  # User cancelled
+
+        try:
+            with open(filepath, 'r') as f:
+                layout_data = json.load(f)
+
+            # 1. Clear the current state
+            for panel in self.panels:
+                self.canvas.delete(panel.rect)
+                self.canvas.delete(panel.label_id)
+                if panel.file_label_id:
+                    self.canvas.delete(panel.file_label_id)
+            self.panels.clear()
+
+            # 2. Apply global settings from the file
+            self.grid_rows_var.set(layout_data['grid_settings']['rows'])
+            self.grid_cols_var.set(layout_data['grid_settings']['cols'])
+            self.paper_size_var.set(layout_data['paper_settings']['size_name'])
+            self.custom_width_var.set(layout_data['paper_settings']['custom_width_cm'])
+            self.custom_height_var.set(layout_data['paper_settings']['custom_height_cm'])
+
+            # Update the canvas to reflect these settings
+            self.update_paper_size()
+
+            # 3. Recreate the panels
+            for panel_info in layout_data['panels']:
+                bbox = panel_info['bbox']
+                x0, y0, x1, y1 = bbox
+                w, h = x1 - x0, y1 - y0
+
+                panel = ResizablePanel(self.canvas, x0, y0, w, h,
+                                       label=panel_info['label'],
+                                       grid_rows=self.grid_rows,
+                                       grid_cols=self.grid_cols,
+                                       paper_bbox=self.canvas.coords(self.paper_rect))
+
+                if panel_info.get('filepath'):
+                    panel.display_file_path(panel_info['filepath'])
+
+                self.panels.append(panel)
+
+            print(f"Layout loaded successfully from {filepath}")
+
+        except Exception as e:
+            print(f"Error loading layout: {e}")
+
+
+    def _browse_save_path(self):
+        """Opens a file dialog to choose a save location and base filename."""
+        initial_path = Path(self.save_path_var.get())
+
+        filepath = filedialog.asksaveasfilename(
+            initialdir=initial_path.parent,
+            initialfile=initial_path.stem,
+            title="Choose save location and base filename",
+            filetypes=[("PDF file", "*.pdf"), ("SVG file", "*.svg"), ("All files", "*.*")]
+        )
+
+        if filepath:
+            # We strip any extension the user provides, as we'll be adding .pdf and .svg ourselves
+            p = Path(filepath)
+            self.save_path_var.set(str(p.with_suffix('')))
 
     def draw_grid(self, paper_coords, nrows, ncols):
         x0, y0, x1, y1 = paper_coords
@@ -616,7 +775,6 @@ class FigureLayoutApp(ttk.Window):
 
 
     def make_figures(self):
-        style_name = self.stylesheet_var.get()
 
         # Use the stored true dimensions (in inches) for the final figure, not the canvas preview size.
         fig_width_in = self.paper_width_cm / 2.54
@@ -624,91 +782,120 @@ class FigureLayoutApp(ttk.Window):
 
         output_dpi = 300
 
+        style_name = self.stylesheet_var.get()
+        selected_font = self.font_var.get()  # Get the font from the dropdown
+        rc_params = {
+            'pdf.fonttype': 42,
+            'font.family': selected_font
+        }
+
         with plt.style.context(splstyle.get_style(style_name)):
-            fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=output_dpi)
+            with plt.rc_context(rc=rc_params):
+                fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=output_dpi)
 
-            # Use GridSpec for layout
-            from matplotlib.gridspec import GridSpec
+                # Use GridSpec for layout
+                from matplotlib.gridspec import GridSpec
 
-            grid_rows = self.grid_rows_var.get()
-            grid_cols = self.grid_cols_var.get()
-            gs = GridSpec(grid_rows, grid_cols, figure=fig)
+                grid_rows = self.grid_rows_var.get()
+                grid_cols = self.grid_cols_var.get()
+                gs = GridSpec(grid_rows, grid_cols, figure=fig)
 
-            # Get paper bounding box
-            paper_x0, paper_y0, paper_x1, paper_y1 = self.canvas.coords(self.paper_rect)
-            paper_w = paper_x1 - paper_x0
-            paper_h = paper_y1 - paper_y0
+                # Get paper bounding box
+                paper_x0, paper_y0, paper_x1, paper_y1 = self.canvas.coords(self.paper_rect)
+                paper_w = paper_x1 - paper_x0
+                paper_h = paper_y1 - paper_y0
 
-            for panel in self.panels:
-                x0, y0, x1, y1 = panel.get_bbox()
-                rel_x0 = (x0 - paper_x0) / paper_w
-                rel_y0 = (y0 - paper_y0) / paper_h
-                rel_x1 = (x1 - paper_x0) / paper_w
-                rel_y1 = (y1 - paper_y0) / paper_h
+                for panel in self.panels:
+                    x0, y0, x1, y1 = panel.get_bbox()
+                    rel_x0 = (x0 - paper_x0) / paper_w
+                    rel_y0 = (y0 - paper_y0) / paper_h
+                    rel_x1 = (x1 - paper_x0) / paper_w
+                    rel_y1 = (y1 - paper_y0) / paper_h
 
-                # Convert relative coords into grid rows/cols
-                col0 = int(round(rel_x0 * grid_cols))
-                row0 = int(round(rel_y0 * grid_rows))
-                col1 = int(round(rel_x1 * grid_cols))
-                row1 = int(round(rel_y1 * grid_rows))
+                    # Convert relative coords into grid rows/cols
+                    col0 = int(round(rel_x0 * grid_cols))
+                    row0 = int(round(rel_y0 * grid_rows))
+                    col1 = int(round(rel_x1 * grid_cols))
+                    row1 = int(round(rel_y1 * grid_rows))
 
-                # Clamp to bounds
-                col0, col1 = sorted([max(0, min(col0, grid_cols - 1)), max(0, min(col1, grid_cols))])
-                row0, row1 = sorted([max(0, min(row0, grid_rows - 1)), max(0, min(row1, grid_rows))])
+                    # Clamp to bounds
+                    col0, col1 = sorted([max(0, min(col0, grid_cols - 1)), max(0, min(col1, grid_cols))])
+                    row0, row1 = sorted([max(0, min(row0, grid_rows - 1)), max(0, min(row1, grid_rows))])
 
-                if col0 == col1:
-                    col1 += 1
-                if row0 == row1:
-                    row1 += 1
+                    if col0 == col1:
+                        col1 += 1
+                    if row0 == row1:
+                        row1 += 1
 
-                subfig_ax = fig.add_subplot(gs[row0:row1, col0:col1])
+                    subfig_ax = fig.add_subplot(gs[row0:row1, col0:col1])
 
-                # Add sub figure lettering
-                subfig_ax.text(-0.1, 1.05, panel.label_text, transform=subfig_ax.transAxes,
-                               fontsize=14, fontweight='bold', va='bottom', ha='right')
+                    # Add sub figure lettering
+                    subfig_ax.text(-0.1, 1.05, panel.label_text, transform=subfig_ax.transAxes,
+                                   fontsize=14, fontweight='bold', va='bottom', ha='right')
 
-                subfig_ax.set_xticks([])
-                subfig_ax.set_yticks([])
+                    subfig_ax.set_xticks([])
+                    subfig_ax.set_yticks([])
 
-                filepath = getattr(panel, "filepath", None)
-                if filepath:
-                    suffix = Path(filepath).suffix.lower()
-                    if suffix in [".png", ".jpg", ".jpeg", ".svg"]:
-                        img = mpimg.imread(filepath)
-                        subfig_ax.imshow(img)
-                        subfig_ax.axis("off")
-                    elif suffix == ".pkl":
-                        try:
-                            with open(filepath, "rb") as f:
-                                original_fig = pickle.load(f)
+                    filepath = getattr(panel, "filepath", None)
+                    if filepath:
+                        suffix = Path(filepath).suffix.lower()
+                        if suffix in [".png", ".jpg", ".jpeg", ".svg"]:
+                            img = mpimg.imread(filepath)
+                            subfig_ax.imshow(img)
+                            subfig_ax.axis("off")
+                        elif suffix == ".pkl":
+                            try:
+                                with open(filepath, "rb") as f:
+                                    original_fig = pickle.load(f)
 
-                            buf = io.BytesIO()
-                            pickle.dump(original_fig, buf)
-                            buf.seek(0)
-                            fig_copy = pickle.load(buf)
+                                buf = io.BytesIO()
+                                pickle.dump(original_fig, buf)
+                                buf.seek(0)
+                                fig_copy = pickle.load(buf)
 
-                            source_axes = fig_copy.get_axes()
-                            if len(source_axes) == 1:
-                                copy_axes_content(source_axes[0], subfig_ax)
-                            else:
-                                subrows = 1
-                                subcols = len(source_axes)
-                                subfig_ax.axis('off')
-                                inner_gs = subfig_ax.get_subplotspec().subgridspec(subrows, subcols, wspace=0.3)
+                                source_axes = fig_copy.get_axes()
+                                if len(source_axes) == 1:
+                                    copy_axes_content(source_axes[0], subfig_ax)
+                                else:
+                                    subrows = 1
+                                    subcols = len(source_axes)
+                                    subfig_ax.axis('off')
+                                    inner_gs = subfig_ax.get_subplotspec().subgridspec(subrows, subcols, wspace=0.3)
 
-                                for i, src_ax in enumerate(source_axes):
-                                    sub_ax = fig.add_subplot(inner_gs[0, i])
-                                    copy_axes_content(src_ax, sub_ax)
+                                    for i, src_ax in enumerate(source_axes):
+                                        sub_ax = fig.add_subplot(inner_gs[0, i])
+                                        copy_axes_content(src_ax, sub_ax)
 
-                        except Exception as e:
-                            subfig_ax.text(0.5, 0.5, f"Failed to load:\n{Path(filepath).name}", ha="center", va="center")
-                else:
-                    subfig_ax.set_facecolor("#f0f0f0")
-                    subfig_ax.text(0.5, 0.5, "Empty", ha="center", va="center")
+                            except Exception as e:
+                                subfig_ax.text(0.5, 0.5, f"Failed to load:\n{Path(filepath).name}", ha="center", va="center")
+                    else:
+                        subfig_ax.set_facecolor("#f0f0f0")
+                        subfig_ax.text(0.5, 0.5, "Empty", ha="center", va="center")
 
-            fig.suptitle("Composed Layout", fontsize=14)
-            fig.tight_layout()
-            fig.show()
+                fig.suptitle("Composed Layout", fontsize=14)
+                fig.tight_layout()
+                # fig.show()
+
+                # --- SAVE THE FIGURE ---
+                save_path_str = self.save_path_var.get()
+                if save_path_str:
+                    try:
+                        p = Path(save_path_str)
+                        # Ensure the parent directory exists
+                        p.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Define paths for both file types
+                        pdf_path = p.with_suffix('.pdf')
+                        svg_path = p.with_suffix('.svg')
+
+                        # Save as PDF and SVG
+                        fig.savefig(pdf_path)
+                        fig.savefig(svg_path, transparent=True)
+
+                        print(f"Figure saved successfully to:\n  {pdf_path}\n  {svg_path}")
+
+                    except Exception as e:
+                        print(f"Error saving figure: {e}")
 
 app = typer.Typer()
 
@@ -753,6 +940,8 @@ def make_example_figures(save_folder=None):
         image = plt.imread(image_file)
 
     ax.imshow(image)
+    ax.set_xticks([])
+    ax.set_yticks([])
 
     save_name = 'example_image.pkl'
     if save_folder is not None:

@@ -1,0 +1,101 @@
+#### tim-modern.mplstyle
+# Author: Tim Sit (with Claude)
+# A clean, modern publication style: soft near-black ink, thin spines,
+# restrained outward ticks, publication sizing (3x3 square / 3x4 tall /
+# 6x3 wide), editable fonts, and a colorblind-safe categorical cycle.
+# Screen preview at 150 dpi; exports at 600 dpi. Pair with sciplotlib's
+# set_bounds() for offset/ranged spines.
+#
+# Usage:
+#   with plt.style.context('tim-modern.mplstyle'):
+#       ...
+# Sizes: set figure.figsize per figure (default 3,3 square; 3,4 tall; 6,3 wide).
+
+# ---- lines & markers ----
+lines.linewidth        : 1.25
+lines.markersize       : 5
+lines.markeredgewidth  : 0
+lines.solid_capstyle   : round
+lines.dash_capstyle    : round
+
+# ---- fonts (kept editable on vector export) ----
+font.family      : sans-serif
+font.sans-serif  : Helvetica, Arial, TeX Gyre Heros, DejaVu Sans
+font.size        : 8
+text.color       : 222222
+pdf.fonttype     : 42
+ps.fonttype      : 42
+svg.fonttype     : none
+
+# ---- axes (frameless: no spines, gridlines carry the scale) ----
+axes.facecolor    : white
+axes.edgecolor    : 222222
+axes.linewidth    : 0.8
+axes.grid         : True
+axes.grid.axis    : y
+axes.grid.which   : major
+axes.titlesize    : 9
+axes.titleweight  : normal
+axes.titlepad     : 8
+axes.titlelocation: center
+axes.labelsize    : 8
+axes.labelcolor   : 222222
+axes.labelpad     : 4
+axes.spines.left   : False
+axes.spines.bottom : False
+axes.spines.top    : False
+axes.spines.right  : False
+axes.axisbelow    : True
+axes.xmargin      : 0.05
+axes.ymargin      : 0.05
+axes.prop_cycle   : cycler('color', ['2a78d6', '1baf7a', 'eda100', '008300', '4a3aa7', 'e34948', 'e87ba4', 'eb6834'])
+
+# ---- ticks (labels only; no tick marks) ----
+xtick.color       : 222222
+ytick.color       : 222222
+xtick.labelsize   : 7
+ytick.labelsize   : 7
+xtick.major.size  : 0
+ytick.major.size  : 0
+xtick.minor.size  : 0
+ytick.minor.size  : 0
+xtick.major.width : 0
+ytick.major.width : 0
+xtick.major.pad   : 4
+ytick.major.pad   : 4
+xtick.top         : False
+ytick.right       : False
+
+# ---- legend ----
+legend.frameon       : False
+legend.fontsize      : 7
+legend.handlelength  : 1.2
+legend.handletextpad : 0.5
+legend.labelspacing  : 0.3
+legend.borderpad     : 0.3
+legend.columnspacing : 1.0
+
+# ---- grid (soft horizontal lines carry the y-scale) ----
+grid.color     : c8c8c8
+grid.linestyle : -
+grid.linewidth : 0.7
+grid.alpha     : 1.0
+
+# ---- figure ----
+figure.figsize   : 3, 3
+figure.dpi       : 150
+figure.facecolor : white
+figure.edgecolor : white
+figure.frameon   : False
+figure.constrained_layout.use : True
+
+# ---- savefig ----
+savefig.dpi         : 600
+savefig.bbox        : tight
+savefig.pad_inches  : 0.02
+savefig.facecolor   : white
+savefig.transparent : False
+
+# ---- scatter ----
+scatter.marker     : o
+scatter.edgecolors : none

@@ -32,6 +32,42 @@ Example::
     composer.register_stats('b', splcompose.NOT_APPLICABLE)
 """
 
+NO_FONT_NORMALIZE = 'spl-no-font-normalize'
+"""gid marking a text artist that :meth:`FigureComposer.normalize_fonts` skips.
+
+:meth:`~FigureComposer.normalize_fonts` rewrites every text size in the figure
+to the composer's ``font_size`` so labels can never drift out of sync.  That is
+wrong for text drawn *inside* a schematic -- a string in a cartoon monitor, a
+symbol in a flow diagram -- which is sized to fit a hand-drawn box, not to match
+the axis labels.  Forcing such text to ``font_size`` overflows the box it lives
+in.  Tag it instead, via :func:`exempt_from_font_normalization`, and it keeps
+whatever size it was created with.
+"""
+
+
+def exempt_from_font_normalization(artist):
+    """Tag an artist so :meth:`FigureComposer.normalize_fonts` leaves its size alone.
+
+    Use for schematic text whose size is dictated by surrounding drawn
+    geometry rather than by the figure's label size.
+
+    Accepts either a text artist or an Axes.  Tagging an Axes exempts that
+    axes wholesale -- its ticks, axis labels, title and any child axes --
+    which is what you want for a small inset that is part of a cartoon.
+
+    Example::
+
+        txt = ax.annotate('LRLR', xy=(0, 0), fontsize=7)
+        splcompose.exempt_from_font_normalization(txt)
+
+        inset = ax.inset_axes([0.5, 0.1, 0.08, 0.08])   # sigmoid in a schematic
+        splcompose.exempt_from_font_normalization(inset)
+
+    Returns the artist, so it can be used inline.
+    """
+    artist.set_gid(NO_FONT_NORMALIZE)
+    return artist
+
 PAPER_DIMENSIONS = {
     'a4': (21.0, 29.7),
     'a4_half_portrait': (10.5, 29.7),
@@ -682,11 +718,18 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
             ])
 
         axes[p.get('label', '')] = ax
+        # Stamp the panel label so tools like the drag editor can name an
+        # axes (and its child colorbars/insets) without any manual tagging.
+        ax._sciplotlib_panel = p.get('label', '') or None
 
         label = p.get('label', '')
         if label:
             pos = gs[r0:r1, c0:c1].get_position(fig)
-            fig.text(pos.x0 + label_x, pos.y1 + label_y, label,
+            p_lx = p.get('label_x')
+            p_ly = p.get('label_y')
+            lx = label_x if p_lx is None else p_lx
+            ly = label_y if p_ly is None else p_ly
+            fig.text(pos.x0 + lx, pos.y1 + ly, label,
                      fontsize=label_font_size, fontweight=label_weight,
                      va='bottom', ha=label_ha)
 
@@ -924,7 +967,8 @@ class FigureComposer:
             plt.rcParams.update(self.rc_params)
 
     def add_panel(self, label, row, col, rowspan, colspan, file=None,
-                  no_axis=False, axes_pad=None, plot_func=None):
+                  no_axis=False, axes_pad=None, plot_func=None,
+                  label_x=None, label_y=None, tick_pad=None):
         """Add a panel to the layout.
 
         Parameters
@@ -933,6 +977,16 @@ class FigureComposer:
             Per-panel override for axes inset padding. Set to ``{}``
             to disable the global axes_pad for this panel. ``None``
             (default) inherits the composer's global axes_pad.
+        label_x, label_y : float or None
+            Per-panel override for the panel label's offset from the cell
+            corner, in figure-fraction units. ``None`` (default) inherits
+            the composer's global ``label_x`` / ``label_y``. Use when one
+            panel's label collides with its own axis decorations.
+        tick_pad : float or None
+            Per-panel override for the tick-label pad, in points. ``None``
+            (default) inherits the composer's global ``tick_pad``. Applies
+            to the panel's own axes only, not to child axes such as
+            colorbars.
         plot_func : callable, optional
             A function with signature ``plot_func(ax)`` that draws content
             onto the panel axes.  Called during :meth:`compose` after the
@@ -959,6 +1013,9 @@ class FigureComposer:
             'no_axis': no_axis,
             'axes_pad': axes_pad,
             'plot_func': plot_func,
+            'label_x': label_x,
+            'label_y': label_y,
+            'tick_pad': tick_pad,
         })
         return self
 
@@ -1193,7 +1250,7 @@ class FigureComposer:
             same normalisation passes as :meth:`to_image` and :meth:`save`
             (``normalize_fonts``, ``fit_axes_to_cells``, ``normalize_spines``),
             then crop to only the target panel's content.  The result matches
-            the final PDF exactly.  Defaults to False.
+            the final PDF exactly.  Defaults to True.
         show_label : bool, optional
             When *normalize* is True, whether to show the panel letter label
             (e.g. "A", "B") in the preview.  Defaults to True.  Has no effect
@@ -1357,7 +1414,14 @@ class FigureComposer:
         - Axes titles → title_font_size
         - Free text above axes (transAxes y > 1) → title_font_size
         - Free text inside axes → font_size
+        - Legend entries + legend title → font_size (overrides any per-call
+          ``ax.legend(fontsize=...)`` so legends can never be left inconsistent
+          with the rest of the figure)
         - Panel labels → label_font_size (unchanged)
+
+        Text tagged with :func:`exempt_from_font_normalization` is skipped and
+        keeps the size it was created with -- use that for schematic text sized
+        to fit drawn geometry.
         """
         if self._fig is None:
             return
@@ -1366,9 +1430,15 @@ class FigureComposer:
         label_sz = self.axis_label_font_size or font_sz
         title_sz = self.title_font_size or font_sz
 
+        def _exempt(text):
+            return text.get_gid() == NO_FONT_NORMALIZE
+
         label_pad = self.axis_label_pad
 
         def _apply_fonts(ax):
+            # an exempt axes keeps its authored sizes wholesale, children included
+            if _exempt(ax):
+                return
             ax.tick_params(labelsize=font_sz)
             ax.xaxis.label.set_fontsize(label_sz)
             ax.yaxis.label.set_fontsize(label_sz)
@@ -1382,11 +1452,24 @@ class FigureComposer:
                 ax.title.set_fontsize(title_sz)
 
             for text in ax.texts:
+                if _exempt(text):
+                    continue
                 if text.get_transform() is ax.transAxes:
                     _, y = text.get_position()
                     text.set_fontsize(title_sz if y > 1.0 else font_sz)
                 else:
                     text.set_fontsize(font_sz)
+
+            # Legend entries (and legend title) are normalized to font_size so a
+            # per-call `fontsize=` override cannot leave a legend inconsistent with
+            # the rest of the figure.
+            legend = ax.get_legend()
+            if legend is not None:
+                for legend_text in legend.get_texts():
+                    legend_text.set_fontsize(font_sz)
+                legend_title = legend.get_title()
+                if legend_title is not None and legend_title.get_text():
+                    legend_title.set_fontsize(font_sz)
 
             for child in getattr(ax, 'child_axes', []):
                 _apply_fonts(child)
@@ -1396,7 +1479,7 @@ class FigureComposer:
 
         panel_ids = getattr(self, '_panel_label_ids', set())
         for text in self._fig.texts:
-            if id(text) in panel_ids:
+            if id(text) in panel_ids or _exempt(text):
                 continue
             text.set_fontsize(font_sz)
 
@@ -1438,13 +1521,16 @@ class FigureComposer:
             plt.rcParams['xtick.major.pad'] = tick_pad
             plt.rcParams['ytick.major.pad'] = tick_pad
 
-        def _apply(ax):
+        panel_tick_pads = {p['label']: p.get('tick_pad') for p in self.panels
+                           if p.get('label')}
+
+        def _apply(ax, pad=tick_pad):
             for spine in ax.spines.values():
                 spine.set_linewidth(spine_lw)
 
             tp_kwargs = {'width': tick_lw}
-            if tick_pad is not None:
-                tp_kwargs['pad'] = tick_pad
+            if pad is not None:
+                tp_kwargs['pad'] = pad
 
             x_params = ax.xaxis.get_tick_params('major')
             y_params = ax.yaxis.get_tick_params('major')
@@ -1460,11 +1546,14 @@ class FigureComposer:
             else:
                 ax.tick_params(axis='y', length=0, **tp_kwargs)
 
+            # children (colorbars, insets) keep the global pad
             for child in getattr(ax, 'child_axes', []):
                 _apply(child)
 
         for ax in self._fig.get_axes():
-            _apply(ax)
+            _lbl = getattr(ax, '_sciplotlib_panel', None)
+            _pad = panel_tick_pads.get(_lbl) if _lbl else None
+            _apply(ax, tick_pad if _pad is None else _pad)
 
     def normalize_linewidths(self):
         """Normalize plot line widths across all axes to a consistent value.
@@ -1670,7 +1759,49 @@ class FigureComposer:
         self.normalize_spines()
         return figure_to_image(self._fig, width=width, dpi=self.dpi, **kwargs)
 
-    def launch_editor(self, patch_types=None):
+    def apply_overrides(self, path, verbose=True):
+        """Apply hand-tuned position overrides written by the drag editor.
+
+        Call *after* :meth:`compose` + plotting all panels (so colorbars/labels
+        exist) and *before* :meth:`save`.  Reapplies positions keyed by stable
+        panel-role addresses (``panel:<label>/xlabel|ylabel|colorbar``), so
+        manual tweaks survive re-runs with **no code edits and no manual
+        tagging**.  A missing file is a no-op.
+
+        Returns ``(n_applied, warnings)``.
+
+        Typical loop::
+
+            fig, axes = composer.compose()
+            # ... plot all panels ...
+            composer.apply_overrides('figure-3.overrides.json')
+            composer.save('figures/figure-3')
+
+        To edit interactively, drag in ``composer.launch_editor(
+        overrides_path='figure-3.overrides.json')`` and close the window; the
+        colorbar/axis-label moves are written to that file automatically.
+        """
+        if self._fig is None:
+            raise RuntimeError("Call compose() and plot all panels before apply_overrides().")
+        from sciplotlib import overrides as _ov
+        return _ov.apply_overrides(self._fig, path, verbose=verbose)
+
+    def print_overrides_as_code(self, path, axes_var='axes'):
+        """Print the overrides in *path* as explicit matplotlib calls, so you can
+        paste them into the compose cell and delete the JSON ("bake" to code).
+
+        Once a figure is final this collapses the two sources (code + JSON) back
+        into one — paste the printed lines where ``fig, axes = composer.compose()``
+        is in scope (replacing the ``apply_overrides`` call), then remove the JSON.
+
+        Returns the code string.
+        """
+        from sciplotlib import overrides as _ov
+        code = _ov.overrides_as_code(_ov.read_overrides(path), axes_var=axes_var)
+        print(code)
+        return code
+
+    def launch_editor(self, patch_types=None, overrides_path=None, screen_dpi=100):
         """Normalize the figure and open the interactive drag-position editor.
 
         Applies :meth:`normalize_fonts`, :meth:`fit_axes_to_cells`, and
@@ -1704,7 +1835,7 @@ class FigureComposer:
 
         from sciplotlib.drag_editor import launch_editor as _launch
         kw = {} if patch_types is None else {'patch_types': patch_types}
-        _launch(self._fig, **kw)
+        _launch(self._fig, overrides_path=overrides_path, screen_dpi=screen_dpi, **kw)
 
     def launch_editor_panel(self, label, plot_func=None, patch_types=None,
                             screen_dpi=96):
@@ -1888,8 +2019,23 @@ class FigureComposer:
                 else:
                     p.pop('plot_func', None)
 
-    def save(self, path, formats=('pdf', 'svg'), dpi=None, transparent=True):
-        """Save the composed figure to one or more file formats."""
+    def save(self, path, formats=('pdf', 'svg'), dpi=None, transparent=True,
+             bbox_inches='standard'):
+        """Save the composed figure to one or more file formats.
+
+        Parameters
+        ----------
+        bbox_inches : 'standard' or 'tight'
+            'standard' (the default) emits exactly ``width_cm`` x
+            ``height_cm``, so the figure is the size you asked for and a
+            typesetter placing it at a fixed width will not rescale it --
+            which would silently rescale every font in it too.
+            'tight' re-crops to the ink bounding box, so the saved size no
+            longer matches ``width_cm``/``height_cm``.  Note that 'tight'
+            also *expands* the canvas to include artists drawn outside it;
+            'standard' clips them instead, so check the figure edges when
+            switching a layout that was built under 'tight'.
+        """
         if self._fig is None:
             raise RuntimeError("Call compose() before save().")
         self.normalize_fonts()
@@ -1900,13 +2046,17 @@ class FigureComposer:
         p = Path(path).with_suffix('')
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        for fmt in formats:
-            save_path = p.with_suffix(f'.{fmt}')
-            kwargs = {'dpi': dpi, 'bbox_inches': 'tight'}
-            if fmt in ('svg', 'png'):
-                kwargs['transparent'] = transparent
-            self._fig.savefig(save_path, **kwargs)
-            print(f"Saved: {save_path}")
+        # savefig(bbox_inches=None) falls back to rcParams['savefig.bbox'],
+        # which stylesheets may set to 'tight'; force it through the rcParam
+        # so 'standard' cannot be silently overridden.
+        with plt.rc_context({'savefig.bbox': bbox_inches}):
+            for fmt in formats:
+                save_path = p.with_suffix(f'.{fmt}')
+                kwargs = {'dpi': dpi, 'bbox_inches': None}
+                if fmt in ('svg', 'png'):
+                    kwargs['transparent'] = transparent
+                self._fig.savefig(save_path, **kwargs)
+                print(f"Saved: {save_path}")
 
     @classmethod
     def from_yaml(cls, filepath, **overrides):

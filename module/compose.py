@@ -2019,12 +2019,70 @@ class FigureComposer:
                 else:
                     p.pop('plot_func', None)
 
+    def check_layout(self, min_gap_pt=1.0, verbose=True, limit=None,
+                     overlay_path=None, **kwargs):
+        """Report artists that overlap, sit too close, or are cut off.
+
+        Wraps :func:`sciplotlib.collide.find_collisions` with the composed
+        figure and its panel labels, so every finding is reported against the
+        panel it lives in.
+
+        Parameters
+        ----------
+        min_gap_pt : float, default 1.0
+            Required clear space between two artists' ink, in points.  Pass
+            ``0.0`` to report only genuine overlaps.  The default asks for a
+            point because an overlap-only check cannot see a label anchored
+            *on* a spine or another label -- the commonest way hand-placed text
+            goes wrong.
+        verbose : bool, default True
+            Print the report.
+        limit : int, optional
+            Print at most this many findings (all are returned).
+        overlay_path : path-like, optional
+            Also save a copy of the figure with a red box round each finding.
+        **kwargs
+            Passed to :func:`~sciplotlib.collide.find_collisions`
+            (``kinds``, ``precision``, ``check_dpi``, ...).
+
+        Returns
+        -------
+        list of :class:`~sciplotlib.collide.Collision`
+            Sorted worst-first; empty when the layout is clean.
+
+        Example::
+
+            fig, axes = composer.compose()
+            ...
+            composer.check_layout(min_gap_pt=1.0,
+                                  overlay_path='figures/fig3-collisions.png')
+        """
+        if self._fig is None:
+            raise RuntimeError("Call compose() before check_layout().")
+        import sciplotlib.collide as splcollide
+
+        collisions = splcollide.find_collisions(
+            self._fig, min_gap_pt=min_gap_pt, **kwargs)
+        if verbose:
+            print(splcollide.format_collisions(
+                collisions, min_gap_pt=min_gap_pt, limit=limit))
+        if overlay_path is not None and collisions:
+            splcollide.save_collision_overlay(self._fig, collisions, overlay_path)
+        return collisions
+
     def save(self, path, formats=('pdf', 'svg'), dpi=None, transparent=True,
-             bbox_inches='standard'):
+             bbox_inches='standard', check_layout=True, min_gap_pt=1.0):
         """Save the composed figure to one or more file formats.
 
         Parameters
         ----------
+        check_layout : bool, default True
+            Run :meth:`check_layout` first and print any overlapping or
+            cut-off artists.  Advisory only -- the figure is saved either way.
+            Set False to skip the check (it costs a couple of extra draws).
+        min_gap_pt : float, default 1.0
+            Minimum separation enforced by that check, in points.  Pass ``0.0``
+            for overlaps only.
         bbox_inches : 'standard' or 'tight'
             'standard' (the default) emits exactly ``width_cm`` x
             ``height_cm``, so the figure is the size you asked for and a
@@ -2041,6 +2099,13 @@ class FigureComposer:
         self.normalize_fonts()
         self.fit_axes_to_cells()
         self.normalize_spines()
+
+        if check_layout:
+            # after normalisation, so what is checked is what is saved
+            try:
+                self.check_layout(min_gap_pt=min_gap_pt, limit=15)
+            except Exception as exc:      # never let a check block a save
+                print(f'Layout check skipped: {exc}')
 
         dpi = dpi or self.dpi
         p = Path(path).with_suffix('')

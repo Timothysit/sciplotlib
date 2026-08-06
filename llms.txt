@@ -13,6 +13,7 @@ sciplotlib is a Python library for composing publication-quality multi-panel mat
 - `FigureComposer` (`sciplotlib.compose`) — create a grid, add named panels, compose, normalise, save. All normalisation parameters (font sizes, spine width, tick length, line width) are set once on the composer and applied uniformly.
 - `add_significance_bars` (`sciplotlib.text`) — draw stacked significance brackets between x-positions, with automatic star conversion and ylim expansion.
 - `register_stats` / `save_stats_report` — attach statistical results to individual panels and export a Markdown + PDF summary document alongside the figure.
+- `check_layout` / `sciplotlib.collide` — find elements that overlap, sit closer than a minimum gap, run off the canvas or get cut off by a clip box. Measured between the pixels each artist actually paints, so text inside a hollow cartoon is not a false positive; run by `composer.save()` by default.
 - Stylesheets — named `.mplstyle` files (`nature-reviews`, `mp-paper`, `economist`, etc.) applied via `composer.apply_style()` or `plt.style.context(splstyle.get_style(...))`.
 - marimo pattern — each panel lives in its own reactive cell; data loaders use `@functools.lru_cache` in a no-input cell to avoid re-running on upstream changes.
 

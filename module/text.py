@@ -110,7 +110,7 @@ def _span_data_top(ax, lo, hi, tol):
 def add_significance_bars(ax, pairs, pvalues=None, labels=None,
                           pad=None, tick_height=None, text_pt_offset=1.0,
                           color='black', linewidth=1.0, fontsize=10,
-                          show_ns=True, ns_label='n.s.',
+                          show_ns=True, ns_label='n.s.', allow_above_ylim=False,
                           star_thresholds=((1e-4, '****'), (1e-3, '***'),
                                            (1e-2, '**'), (5e-2, '*')),
                           expand_ylim=True):
@@ -143,6 +143,13 @@ def add_significance_bars(ax, pairs, pvalues=None, labels=None,
         P-value thresholds for star labels.
     expand_ylim : bool
         If True, expand ylim to fit brackets.
+    allow_above_ylim : bool
+        Set True when the brackets are *meant* to sit above the axes -- e.g. in a
+        panel's top margin, level with the titles of its neighbours -- which keeps
+        the data band full height.  Suppresses the warning that otherwise fires
+        when ``expand_ylim`` is False and a bracket ends up outside the view.
+        Only safe where nothing later switches clipping on for the bracket lines
+        (in a composed figure, plot the panel after ``compose()``).
 
     Returns
     -------
@@ -201,14 +208,33 @@ def add_significance_bars(ax, pairs, pvalues=None, labels=None,
                 [y - tick_height, y, y, y - tick_height],
                 color=color, lw=linewidth, clip_on=False, zorder=10)
         is_star = bool(txt) and set(txt) <= {'*'}
+        # annotation_clip=False matters as much as clip_on: annotate() defaults to
+        # dropping the label entirely when its xy lies outside the axes, so a
+        # bracket parked above the view limits loses its stars silently -- the
+        # bracket line still draws (clip_on=False), leaving a bare bracket.
         ax.annotate(txt, xy=((lo + hi) / 2.0, y),
                     xytext=(0, text_pt_offset), textcoords='offset points',
                     ha='center', va='center_baseline' if is_star else 'bottom',
-                    color=color, fontsize=fontsize, clip_on=False, zorder=10)
+                    color=color, fontsize=fontsize, clip_on=False,
+                    annotation_clip=False, zorder=10)
         top_line = max(top_line, y)
 
     if expand_ylim and (top_line + 2 * pad) > y1:
         ax.set_ylim(y0, top_line + 2 * pad)
+    elif not expand_ylim and not allow_above_ylim and top_line > y1:
+        # The caller took responsibility for the y-range and left the top bracket
+        # *line* above the visible axes, where a composed figure clips it away
+        # (clip_all_axes clips lines, not text) leaving a stranded label -- or, with
+        # the label clipped too, nothing at all.  Nothing downstream can see this,
+        # so say it here.  A label sitting a line above the topmost bracket is not
+        # flagged: spilling that into a panel's top margin is a legitimate choice.
+        import warnings
+        warnings.warn(
+            f'add_significance_bars: highest bracket line is at y={top_line:.3g} but '
+            f'ylim ends at {y1:.3g}, so the top bracket(s) fall outside the axes. '
+            f'Raise the upper ylim to at least {top_line:.3g} (plus about one text '
+            f'line for the label), reduce pad, or pass expand_ylim=True.',
+            stacklevel=2)
 
     return top_line
 

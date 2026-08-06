@@ -373,6 +373,51 @@ pip install sciplotlib[stats-pdf]
 ```
 
 
+### Layout checks — overlapping, touching and cut-off elements
+
+Hand-placed labels drift whenever fonts or panel sizes change, and the damage is
+easy to miss: a descender disappearing under an image, two labels grazing each
+other, a y-label cropped at the canvas edge. `composer.save()` checks for that
+automatically and prints what it finds (it never blocks the save). By default it
+asks for **1 pt of clearance**, not merely the absence of overlap — a label
+anchored on a spine with `ax.text(0, y, ..., transform=ax.transAxes)` clears it by
+well under a point, which an overlap-only check cannot see:
+
+```
+Layout check: 2 overlap(s)
+   1. [c] overlap: text "Algorithm 0" overlaps image 500x457 (2.33 pt^2, hidden underneath)  ->  move up >= 0.7 pt
+   2. [j] overlap: text "End" overlaps text "P(stochastic)" (0.78 pt^2)  ->  move up >= 0.7 pt
+```
+
+Ask for more (or less: `min_gap_pt=0.0` reports overlaps only), and get an image
+with every finding boxed in red (numbered to match the report):
+
+```python
+composer.check_layout(min_gap_pt=1.5, overlay_path='figures/f3-collisions.png')
+```
+
+Labels are checked against each other **and against the drawing** — curves,
+markers, axis spines — so `min_gap_pt` is also how you keep an in-plot label off
+the line it names, or off the spine it sits beside.
+
+Measurements are made between the pixels each element actually **paints**, not
+between bounding boxes — so text sitting inside a hollow cartoon, or an icon in
+the empty middle of a drawn screen, is correctly left alone, while a clipped
+descender is caught. Suggested moves are found by sliding the ink until it is
+clear, which matters for curves: box arithmetic would tell a label to drop below
+the curve's lowest point anywhere in the panel when a couple of points of local
+clearance is the real answer. Deliberate overlaps can be silenced:
+
+```python
+import sciplotlib.collide as splcollide
+splcollide.exempt_from_collision_check(txt)   # ignore this element
+splcollide.allow_overlap(txt, image)          # allow one specific pair
+```
+
+Works on any matplotlib figure, not just composed ones:
+`splcollide.check_layout(fig, min_gap_pt=1.0)`.
+
+
 ## Other fun stuff 
 
 I am also including other aesthetically pleasing plot styles that are non-academic. For example, to create plots from The Economist, do: 

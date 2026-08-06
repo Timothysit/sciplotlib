@@ -319,6 +319,25 @@ add_significance_bars(
 
 Brackets are stacked automatically (narrowest span placed lowest). Star thresholds: `*` p<0.05, `**` p<0.01, `***` p<0.001, `****` p<0.0001.
 
+**Stack spacing is set by the label height, not by `pad` alone.** Overlapping brackets
+are placed `2*pad` apart, so `pad` must be at least half the rendered label height or
+the labels land on the bracket above. Watch for `fontsize=` at the call site being
+overridden by `normalize_fonts()` — a call written for 5 pt labels gets 9 pt ones, and
+the spacing that fit no longer does.
+
+**Brackets may live above the axes on purpose** — in a panel's top margin, level with
+its neighbours' titles — which keeps the data band full height. That needs
+`expand_ylim=False` and `allow_above_ylim=True`; the latter only suppresses the warning
+that otherwise fires when a bracket ends up outside the view. Two things make it work:
+labels are drawn `annotation_clip=False` (matplotlib's `annotate` otherwise *silently
+drops* a label whose `xy` is outside the axes — the bracket line draws and the star
+vanishes), and the bracket lines are `clip_on=False`. In a composed figure, plot such a
+panel **after** `compose()`, or `clip_all_axes` will clip the lines away.
+
+Without `allow_above_ylim`, a bracket above the view limits raises a warning naming the
+ylim you need — the failure is otherwise invisible to any collision check, because a
+label that was never drawn cannot be found overlapping anything.
+
 ---
 
 ## Stylesheets
@@ -347,6 +366,133 @@ with plt.style.context(splstyle.get_style('nature-reviews')):
 
 ---
 
+## Layout checks — overlaps, gaps, clipping
+
+`sciplotlib.collide` finds artists that overlap, sit closer than a minimum gap,
+run off the canvas, or get cut off by their own clip box. Hand-placed labels in
+schematics drift out of position whenever fonts or panel sizes change, and the
+failure is silent — a descender vanishing under an image is invisible until
+someone looks at the printed page.
+
+Labels are checked against each other **and against the drawing**: curves,
+markers and axis spines. `min_gap_pt` is how you ask for breathing room between
+an in-plot label and the line it names, or between a label and the spine it sits
+beside.
+
+```python
+import sciplotlib.collide as splcollide
+
+composer.check_layout()                     # 1 pt of clearance — what save() does
+composer.check_layout(min_gap_pt=0.0)       # overlaps only
+composer.check_layout(min_gap_pt=1.5)       # also flag anything within 1.5 pt
+composer.check_layout(min_gap_pt=1.0, overlay_path='figures/f3-collisions.png')
+```
+
+Report lines are numbered to match the red boxes in the overlay image:
+
+```
+Layout check: 2 overlap(s), 2 pair(s) closer than 1.5 pt
+   1. [c] overlap: text "Algorithm 0" overlaps image 500x457 (2.33 pt^2, hidden underneath)  ->  move up >= 0.7 pt
+   2. [j] overlap: text "End" overlaps text "P(stochastic)" (0.78 pt^2)  ->  move up >= 0.7 pt
+   3. [k] too-close: text "Late sessions" is 0.72 pt from left spine  ->  move right >= 1.8 pt
+   4. [o] too-close: text "Mouse" is 1.80 pt from line (gray)  ->  move down >= 1.1 pt
+```
+
+`composer.save()` runs the check by default and prints findings without blocking
+the save (`check_layout=False` to skip, `min_gap_pt=` to change the requirement).
+
+### How it measures — and why not bounding boxes
+
+Default `precision='ink'`: every candidate artist is drawn alone into an Agg
+buffer and reduced to a mask of the pixels it actually paints. Boxes would be
+useless here — a text's box spans the font's whole ascent-to-descent band, so
+boxes touch long before glyphs do, and an SVG rendered to RGBA is mostly
+transparent, so **text inside a hollow cartoon overlaps the image's box while
+touching none of its strokes**. Working from ink means deliberate arrangements
+(a label inside a drawn monitor, an icon in its empty middle) come out clean
+without needing to be whitelisted. `precision='bbox'` is the fast, pessimistic
+alternative (it adds a containment rule to suppress the worst false positives).
+
+Only artists matplotlib *really draws* are considered: one pass runs with every
+`draw` wrapped, and anything never called is dropped. Without that, out-of-view
+tick labels and every tick/axis label under `ax.axis('off')` — all still
+`get_visible() == True`, all happy to paint when asked directly — would collide
+with real content.
+
+### What is checked against what
+
+`kinds` defaults to `('text', 'image', 'line', 'spine')` (`collide.DEFAULT_KINDS`).
+Three exclusions are deliberate, and each would otherwise bury the real findings:
+
+| Excluded | Why |
+|---|---|
+| **Pairs with no text** (`require_text`, auto-on when any drawing kind is checked) | Plot elements are *supposed* to touch: curves cross, markers pile up, a spine meets its ticks. A label touching any of them is the defect. |
+| **`'patch'`, `'fill'`** (opt-in) | A '?' on a cartoon monitor, a value in a heatmap cell, a label across a pale error band — all ordinary practice. |
+| **Gridlines, axes/figure background patches** (always) | Each spans a whole region, so every label inside the axes would "overlap" it. The background patch is found by identity from `ax.patch`, since its own `.axes` attribute is not reliably set. |
+
+A tick label is allowed to sit close to **its own** axes' spine and tick marks —
+that gap is what `tick_pad` sets — but an actual overlap there is still reported,
+and any *other* text near that spine is reported normally. That distinction is
+what makes `min_gap_pt` usable at all: without it every tick label in the figure
+fires at any threshold above `tick_pad`.
+
+### Reporting
+
+Each `Collision` carries `kind` (`'overlap'`, `'too-close'`, `'outside-figure'`,
+`'clipped'`), `gap_pt`, `overlap_pt2`, `panel`, `bbox_fig`, `occluded` (the other
+artist is drawn on top, so this one is hidden), and `suggestion` — the smallest
+axis-aligned move that clears the problem.
+
+The suggestion is measured by **sliding the mask** until the gap is satisfied
+(`scipy` distance transform; falls back to box arithmetic without it). Box
+arithmetic is hopeless against anything non-convex: to clear a *curve's* box, a
+label would be told to move below the curve's lowest point anywhere in the panel
+— "move down >= 5.2 pt" where 1.8 pt of local clearance is the real answer.
+
+### Silencing deliberate overlaps
+
+```python
+splcollide.exempt_from_collision_check(txt)   # ignore this artist entirely
+splcollide.allow_overlap(txt, image)          # allow one pair, keep checking both otherwise
+```
+
+### Signatures
+
+```python
+splcollide.find_collisions(
+    fig,
+    min_gap_pt=1.0,              # required clear space in points; 0.0 = overlaps only
+    kinds=DEFAULT_KINDS,         # text, image, line, spine (+ opt-in patch, fill, legend)
+    precision='ink',             # or 'bbox'
+    check_dpi=200,               # mask resolution: 1 pt = check_dpi/72 px
+    alpha_threshold=16,          # alpha counting as ink (skips AA fringe)
+    ignore_contained=None,       # default False for ink, True for bbox
+    check_figure_bounds=True,
+    require_text=None,           # auto: True once any drawing kind is checked
+    include=None,                # include(artist) -> bool filter
+) -> list[Collision]
+
+splcollide.check_layout(fig, min_gap_pt=1.0, verbose=True, limit=None, **kw)
+splcollide.format_collisions(collisions, min_gap_pt=0.0, limit=None)
+splcollide.save_collision_overlay(fig, collisions, path, dpi=150, limit=None)
+```
+
+Use as a build-time assertion: `assert not splcollide.check_layout(fig)`.
+
+**Cost:** two figure draws plus one isolated draw per candidate — on a 20-panel
+figure that is well under a second, so leaving it on in `save()` is free.
+
+**`min_gap_pt` defaults to 1 pt, not 0.** The worry was that figures pack cartoon
+text tightly on purpose and a non-zero default would be noisy. Measured across four
+full-page paper figures it produced **four findings, all real** — so the noise never
+materialised, while overlap-only checking was blind to the commonest mistake in
+hand-placed text: a label anchored *on* something. `ax.text(0, y, ...,
+transform=ax.transAxes)` puts a label on the y-axis spine, clearing it only by the
+first glyph's side bearing (~0.7 pt) — an overlap check sees nothing. Pass
+`min_gap_pt=0.0` for overlaps only.
+
+---
+
 ## Other utilities
 
 ```python
@@ -372,6 +518,8 @@ splutil.savefig(fig, 'path/to/figure', dpi=300, fig_exts=['.png', '.svg'])
 **Never clip Spine objects.** Spines sit exactly on the axes boundary, so clipping halves their visible stroke width. Remove any `spine.set_clip_on(True)` calls.
 
 **`fit_axes_to_cells` grouping.** Panels are aligned by `(row_start, row_end)` pairs, not just `row_start`. Panels that share a start row but have different rowspans are in different alignment groups — this is intentional.
+
+**`fit_axes_to_cells` overrides `set_position`.** Its last pass forces every panel in an alignment group to one `y0` and height, so growing or shrinking one panel's axes inside its plot function is silently undone. To give one panel of a row more room, change what it *draws* (e.g. put significance brackets in the top margin instead of inside the data range), or move it to its own alignment group.
 
 **`subplots_adjust` corrupts GridSpec.** Never call `fig.subplots_adjust` or `plt.tight_layout` inside a panel function. These affect the top-level GridSpec and misalign all other panels.
 

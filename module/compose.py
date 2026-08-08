@@ -927,6 +927,10 @@ class FigureComposer:
         self._fig = None
         self._axes = None
         self._stats = {}
+        # Set by apply_overrides(); panel-position entries are replayed from
+        # here at the end of fit_axes_to_cells (see _apply_deferred_overrides).
+        self._overrides_path = None
+        self._overrides_verbose = True
 
     def apply_style(self):
         """Apply the composer's stylesheet and rc_params globally.
@@ -1647,6 +1651,23 @@ class FigureComposer:
             return
 
         fig = self._fig
+
+        # Make repeated calls idempotent: remember where each panel started
+        # (the gridspec placement, plus any set_position the plotting code did)
+        # and rewind to it, so the shrink loop below always measures from the
+        # same baseline.  Without this, a second fit — or a fit after a panel
+        # override moved something — would compound onto the previous result.
+        for p in self.panels:
+            label = p.get('label', '')
+            if not label or label not in self._axes:
+                continue
+            ax = self._axes[label]
+            base = getattr(ax, '_sciplotlib_fit_base', None)
+            if base is None:
+                ax._sciplotlib_fit_base = tuple(ax.get_position().bounds)
+            else:
+                ax.set_position(list(base))
+
         gs_kwargs = dict(wspace=self._wspace, hspace=self._hspace)
         if self.margins is not None:
             for key in ('left', 'right', 'top', 'bottom'):
@@ -1738,6 +1759,27 @@ class FigureComposer:
                 dx = max_x0 - pos.x0
                 self._axes[l].set_position([max_x0, pos.y0, pos.width - dx, pos.height])
 
+        # Hand-tuned panel positions are deltas against the layout just
+        # computed, so they land last — after the row/column alignment passes
+        # above, which would otherwise undo them.
+        self._apply_deferred_overrides()
+
+    def _apply_deferred_overrides(self, verbose=None):
+        """Apply the override kinds that must run after :meth:`fit_axes_to_cells`.
+
+        Panel positions are stored as offsets from the fitted layout, so they
+        can only be applied once that layout exists.  :meth:`apply_overrides`
+        records the path and skips them; this replays them at the end of the
+        normalisation chain.  No-op if no overrides file has been registered.
+        """
+        if self._fig is None or not getattr(self, '_overrides_path', None):
+            return 0, []
+        from sciplotlib import overrides as _ov
+        if verbose is None:
+            verbose = getattr(self, '_overrides_verbose', True)
+        return _ov.apply_overrides(self._fig, self._overrides_path,
+                                   verbose=verbose, kinds=_ov.DEFERRED_KINDS)
+
     def compose_image(self, wspace=None, hspace=None, clip_panels=True, width=None, **kwargs):
         """Compose the figure and return it as a marimo-compatible HTML image.
 
@@ -1784,7 +1826,13 @@ class FigureComposer:
         if self._fig is None:
             raise RuntimeError("Call compose() and plot all panels before apply_overrides().")
         from sciplotlib import overrides as _ov
-        return _ov.apply_overrides(self._fig, path, verbose=verbose)
+        # Panel positions are deltas against the layout fit_axes_to_cells
+        # produces, which has not run yet — record the path so save()/to_image()
+        # can replay them once it has.  Everything else applies now.
+        self._overrides_path = path
+        self._overrides_verbose = verbose
+        return _ov.apply_overrides(self._fig, path, verbose=verbose,
+                                   skip_kinds=_ov.DEFERRED_KINDS)
 
     def print_overrides_as_code(self, path, axes_var='axes'):
         """Print the overrides in *path* as explicit matplotlib calls, so you can
@@ -1801,30 +1849,51 @@ class FigureComposer:
         print(code)
         return code
 
-    def launch_editor(self, patch_types=None, overrides_path=None, screen_dpi=100):
-        """Normalize the figure and open the interactive drag-position editor.
+    def launch_editor(self, patch_types=None, overrides_path=None, screen_dpi=100,
+                      include_panels=True, snap=True, editor='panel'):
+        """Normalize the figure and open an interactive position editor.
 
-        Applies :meth:`normalize_fonts`, :meth:`fit_axes_to_cells`, and
-        :meth:`normalize_spines` before opening the window, so what you see
-        in the editor is pixel-identical to the final PDF/SVG output.
-        Blocks until the editor window is closed.
+        Applies :meth:`normalize_fonts`, :meth:`fit_axes_to_cells` and
+        :meth:`normalize_spines` first, so what you edit is pixel-identical to
+        the final PDF/SVG. Blocks until the window closes.
 
-        Call this *after* composing and plotting all panels::
+        Call after composing and plotting every panel::
 
             fig, axes = composer.compose()
-            plot_panel_a(axes['a'])
-            plot_panel_j(axes['j'])   # ... all panels
-            composer.launch_editor()  # adjust, close → paste coordinates back
+            plot_panel_a(axes['a'])            # ... all panels
+            composer.launch_editor(overrides_path='figure-3.overrides.json')
 
-        Updated coordinates are printed to the terminal where marimo was
-        started.  Paste the ``.set_position`` / ``.xy`` / ``.set_xy`` values
-        back into your plotting functions and re-run.
+        Two editors are available:
+
+        ``editor='panel'`` (default)
+            :mod:`sciplotlib.panel_editor` — a tk application with an element
+            tree, numeric position fields and buttons. Needs tkinter + Pillow.
+        ``editor='mpl'``
+            :mod:`sciplotlib.drag_editor` — a bare matplotlib window driven
+            entirely by mouse and keyboard. Needs an interactive matplotlib
+            backend (``uv add pyside6``). Use it where tkinter is unavailable.
+
+        Both edit the same things and write the same overrides file: drag a
+        panel to move it, grab an edge to resize, and on save every move of an
+        addressable artist (**panel axes**, axis labels, colorbars, insets,
+        ``place_image`` overlays and ``ax.text``) is written to
+        *overrides_path*, to be re-applied by :meth:`apply_overrides`. Panel
+        positions are stored as offsets from the fitted layout, so they survive
+        a change of grid or figure size.
 
         Parameters
         ----------
+        editor : {'panel', 'mpl'}
+            Which editor to open.
         patch_types : tuple of type, optional
-            Patch subclasses to make draggable.  Defaults to
-            ``(Rectangle,)``.  Pass ``None`` to disable patch dragging.
+            Patch subclasses to make draggable (``editor='mpl'`` only).
+        include_panels : bool
+            Allow panel axes to be moved and resized.
+        snap : bool
+            Snap a dragged axes edge onto a neighbouring panel's edge.
+        screen_dpi : float
+            Render dpi for the on-screen preview. Positions are relative, so
+            this changes nothing but the size of the preview.
         """
         if self._fig is None:
             raise RuntimeError("Call compose() and plot all panels before launch_editor().")
@@ -1833,9 +1902,18 @@ class FigureComposer:
         self.fit_axes_to_cells()
         self.normalize_spines()
 
+        if editor == 'panel':
+            from sciplotlib.panel_editor import launch_panel_editor
+            launch_panel_editor(self._fig, overrides_path=overrides_path,
+                                view_dpi=max(screen_dpi, 150), snap=snap)
+            return
+        if editor != 'mpl':
+            raise ValueError(f"editor must be 'panel' or 'mpl', got {editor!r}")
+
         from sciplotlib.drag_editor import launch_editor as _launch
         kw = {} if patch_types is None else {'patch_types': patch_types}
-        _launch(self._fig, overrides_path=overrides_path, screen_dpi=screen_dpi, **kw)
+        _launch(self._fig, overrides_path=overrides_path, screen_dpi=screen_dpi,
+                include_panels=include_panels, snap=snap, **kw)
 
     def launch_editor_panel(self, label, plot_func=None, patch_types=None,
                             screen_dpi=96):

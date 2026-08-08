@@ -28,6 +28,16 @@ layout = [
     "ttkbootstrap",
     "typer",
 ]
+# Interactive position editor: composer.launch_editor()
+# The default tk editor needs Pillow (tkinter is stdlib, but on Debian/Ubuntu
+# comes from the separate python3-tk package). pyside6 is only for the
+# matplotlib-window fallback, editor='mpl'.
+editor = [
+    "pillow",
+]
+editor-mpl = [
+    "pyside6",
+]
 # Marimo notebook support
 notebooks = [
     "marimo>=0.9",
@@ -44,7 +54,8 @@ stats-pdf = [
 ]
 # Everything for local development
 dev = [
-    "sciplotlib[layout,notebooks,svg,stats-pdf]",
+    "sciplotlib[layout,notebooks,svg,stats-pdf,editor]",
+    "pytest",
 ]
 
 [build-system]

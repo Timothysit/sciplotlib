@@ -1,6 +1,6 @@
 [project]
 name = "sciplotlib"
-version = "0.0.8"
+version = "0.0.9"
 description = "Custom functions to improve the look of matplotlib plots for scientific visualisation."
 authors = [
     { name = "Timothy Sit", email = "sitpakhang@gmail.com" },

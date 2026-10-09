@@ -68,12 +68,133 @@ def exempt_from_font_normalization(artist):
     artist.set_gid(NO_FONT_NORMALIZE)
     return artist
 
+def manual_layout():
+    """Layout engine for a figure whose axes the composer places itself.
+
+    Pass as ``plt.figure(layout=manual_layout())``.  A stylesheet with
+    ``figure.autolayout`` (mp-paper has it) would otherwise run
+    ``tight_layout`` on every draw, warning each time that these axes are
+    incompatible with it and burying the layout check's report.
+
+    ``layout='none'`` is not enough.  It leaves the figure with *no* engine, and
+    ``savefig(bbox_inches='tight')`` -- which :meth:`FigureComposer.to_image`
+    uses -- swaps the engine out and then "restores" that ``None``, which
+    matplotlib reads as "use rcParams": ``tight_layout`` is back after the first
+    preview.  A do-nothing placeholder engine survives the round trip.
+    """
+    from matplotlib.layout_engine import PlaceHolderLayoutEngine
+    return PlaceHolderLayoutEngine(adjust_compatible=True, colorbar_gridspec=True)
+
+
+def set_position_keeping_layout_flag(ax, bounds):
+    """``ax.set_position(bounds)`` without the ``in_layout`` side effect.
+
+    matplotlib's ``set_position`` turns ``in_layout`` off, on the assumption
+    that a hand-placed axes should be excluded from ``tight_layout`` /
+    ``constrained_layout``.  That assumption is wrong here: the composer places
+    every panel itself, so after one :meth:`FigureComposer.fit_axes_to_cells`
+    pass *no* panel would be "in layout" any more.  The flag also governs
+    :meth:`~matplotlib.figure.Figure.get_tightbbox`, so the side effect quietly
+    empties the figure's tight bounding box -- which is exactly what
+    ``save(bbox_inches='tight')`` crops to.
+
+    The flag is read before the move and written back after, so a deliberate
+    ``artist.set_in_layout(False)`` -- the trick for keeping a colorbar or a
+    free-text axis label out of a row's tight bbox -- still survives.
+
+    (This is unrelated to the "Axes not compatible with tight_layout" warning
+    the layout checker can emit: that one comes from the composer's GridSpec
+    carrying explicit margins/wspace, which matplotlib counts as locally
+    modified subplot params.)
+    """
+    flag = ax.get_in_layout()
+    ax.set_position(bounds)
+    ax.set_in_layout(flag)
+    return ax
+
+
+REDRAW_HOOK_ATTR = '_sciplotlib_redraw'
+
+
+def set_redraw_hook(ax, func, **spec):
+    """Register how to re-draw *ax*'s contents when its size changes.
+
+    Most panel content does not care about the axes' size: matplotlib re-draws
+    data artists at whatever size the axes ends up.  Some content *is* laid out
+    against the size -- text wrapped to the panel width is the motivating case
+    -- and has to be rebuilt when the panel is resized in the editor.
+
+    *func* is called as ``func(ax, **spec)`` and must clear and re-draw
+    whatever it owns.  It has to be a **module-level function**, not a closure
+    or a lambda: the editor runs in a subprocess on a pickled copy of the
+    figure, and only functions picklable by qualified name survive that trip.
+    *spec* must likewise be plain picklable data.
+
+    ::
+
+        def _draw_caption(ax, text, fontsize):
+            ax.clear(); ax.set_axis_off()
+            ax.text(0, 1, wrap(text, ax), fontsize=fontsize, va='top')
+
+        _draw_caption(ax, text=caption, fontsize=9)
+        set_redraw_hook(ax, _draw_caption, text=caption, fontsize=9)
+    """
+    setattr(ax, REDRAW_HOOK_ATTR, (func, spec))
+    return ax
+
+
+def run_redraw_hook(ax):
+    """Run *ax*'s redraw hook if it has one. Returns True if one ran."""
+    hook = getattr(ax, REDRAW_HOOK_ATTR, None)
+    if hook is None:
+        return False
+    func, spec = hook
+    func(ax, **spec)
+    # ax.clear() inside the hook drops the attribute's siblings but not the
+    # hook itself; re-set it so repeated resizes keep working.
+    setattr(ax, REDRAW_HOOK_ATTR, (func, spec))
+    return True
+
+
+NO_LINEWIDTH_NORMALIZE = '_sciplotlib_no_linewidth_normalize'
+
+
+def exempt_from_linewidth_normalization(artist):
+    """Tag an artist so :meth:`FigureComposer.normalize_linewidths` skips it.
+
+    ``normalize_linewidths`` sets *every* ``Line2D`` to one width, which is
+    right for data traces and wrong for anything whose line weight carries
+    meaning of its own -- a raster of one short line per trial, a hand-drawn
+    cartoon, a hatch built from strokes.  On a poster the mismatch is stark:
+    a 2.5 pt house width turns a 200-trial choice raster into a solid block.
+
+    Accepts a ``Line2D`` or an ``Axes``.  Tagging an Axes exempts every line in
+    it and in its child axes, which is usually what you want::
+
+        mp_plots.plot_mp_choices(session_df, ax=raster, lw=0.8)
+        exempt_from_linewidth_normalization(raster)
+
+    Returns the artist, so it can be used inline.
+    """
+    setattr(artist, NO_LINEWIDTH_NORMALIZE, True)
+    return artist
+
+
 PAPER_DIMENSIONS = {
     'a4': (21.0, 29.7),
     'a4_half_portrait': (10.5, 29.7),
     'a0_portrait': (84.1, 118.9),
     'a0_landscape': (118.9, 84.1),
+    'a1_portrait': (59.4, 84.1),
+    'a1_landscape': (84.1, 59.4),
+    'a2_portrait': (42.0, 59.4),
+    'a2_landscape': (59.4, 42.0),
     '16:9_monitor': (59.7, 33.6),
+    # Presentation canvases, matching PowerPoint/Keynote defaults exactly so a
+    # deck exported here concatenates with one built there without rescaling.
+    'slide_16x9': (33.867, 19.05),    # 13.333 x 7.5 in -- PowerPoint widescreen
+    'slide_16x10': (33.867, 21.167),  # 13.333 x 8.333 in -- Keynote widescreen
+    'slide_4x3': (25.4, 19.05),       # 10 x 7.5 in -- PowerPoint standard
 }
 
 
@@ -693,6 +814,9 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
             if key in margins:
                 gs_kwargs[key] = margins[key]
     gs = GridSpec(grid_rows, grid_cols, figure=fig, **gs_kwargs)
+    # Stash the gridspec so callers can resolve cell rectangles after the fact
+    # (PosterComposer draws its section blocks from grid cells, not from axes).
+    fig._sciplotlib_gridspec = gs
 
     axes = {}
     for p in panels:
@@ -706,16 +830,21 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
         ax = fig.add_subplot(gs[r0:r1, c0:c1])
 
         pad = p.get('axes_pad', axes_pad)
-        if pad is not None:
+        if pad:
+            # Only when there is something to inset. A zero (or empty) pad
+            # means "leave this panel on its cell", and calling set_position
+            # anyway is not free: matplotlib flips in_layout off inside it,
+            # which makes the axes look tight_layout-incompatible ever after.
             cell = ax.get_position()
             pl = pad.get('left', 0)
             pb = pad.get('bottom', 0)
             pr = pad.get('right', 0)
             pt = pad.get('top', 0)
-            ax.set_position([
-                cell.x0 + pl, cell.y0 + pb,
-                cell.width - pl - pr, cell.height - pb - pt,
-            ])
+            if pl or pb or pr or pt:
+                set_position_keeping_layout_flag(ax, [
+                    cell.x0 + pl, cell.y0 + pb,
+                    cell.width - pl - pr, cell.height - pb - pt,
+                ])
 
         axes[p.get('label', '')] = ax
         # Stamp the panel label so tools like the drag editor can name an
@@ -723,7 +852,7 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
         ax._sciplotlib_panel = p.get('label', '') or None
 
         label = p.get('label', '')
-        if label:
+        if label and not p.get('no_label'):
             pos = gs[r0:r1, c0:c1].get_position(fig)
             p_lx = p.get('label_x')
             p_ly = p.get('label_y')
@@ -927,6 +1056,10 @@ class FigureComposer:
         self._fig = None
         self._axes = None
         self._stats = {}
+        #: Findings of the layout check run by the last :meth:`save` -- a list
+        #: of :class:`~sciplotlib.collide.Collision`, empty when clean, None if
+        #: the check was skipped or failed.
+        self.layout_findings = None
         # Set by apply_overrides(); panel-position entries are replayed from
         # here at the end of fit_axes_to_cells (see _apply_deferred_overrides).
         self._overrides_path = None
@@ -972,11 +1105,24 @@ class FigureComposer:
 
     def add_panel(self, label, row, col, rowspan, colspan, file=None,
                   no_axis=False, axes_pad=None, plot_func=None,
-                  label_x=None, label_y=None, tick_pad=None):
+                  label_x=None, label_y=None, tick_pad=None,
+                  fit_exempt=False, no_label=False):
         """Add a panel to the layout.
 
         Parameters
         ----------
+        no_label : bool, default False
+            Don't draw the panel letter.  The *label* is still the key this
+            panel's axes is returned under, so unlabelled panels can still be
+            distinct -- use for background images, text blocks, and other
+            furniture that is not a lettered panel.
+        fit_exempt : bool, default False
+            Leave this panel's position exactly where the grid put it:
+            :meth:`fit_axes_to_cells` skips it in the shrink pass *and* in
+            the row/column alignment passes.  Use for panels whose content
+            is positioned in axes fractions and so must not be rescaled --
+            a block of body text, a full-bleed background image, a
+            hand-placed schematic.  Ordinary data panels want the default.
         axes_pad : dict or None
             Per-panel override for axes inset padding. Set to ``{}``
             to disable the global axes_pad for this panel. ``None``
@@ -1020,6 +1166,8 @@ class FigureComposer:
             'label_x': label_x,
             'label_y': label_y,
             'tick_pad': tick_pad,
+            'fit_exempt': fit_exempt,
+            'no_label': no_label,
         })
         return self
 
@@ -1218,7 +1366,8 @@ class FigureComposer:
         size = self.panel_figsize(label, wspace=wspace, hspace=hspace)
         if pad_inches:
             pad_w, pad_h = pad_inches
-            fig = plt.figure(figsize=(size[0] + pad_w, size[1] + pad_h), dpi=self.dpi)
+            fig = plt.figure(figsize=(size[0] + pad_w, size[1] + pad_h), dpi=self.dpi,
+                             layout=manual_layout())
             ax = fig.add_axes([
                 (pad_w / 2) / (size[0] + pad_w),
                 (pad_h / 2) / (size[1] + pad_h),
@@ -1226,7 +1375,7 @@ class FigureComposer:
                 size[1] / (size[1] + pad_h)
             ])
         else:
-            fig, ax = plt.subplots(figsize=size, dpi=self.dpi)
+            fig, ax = plt.subplots(figsize=size, dpi=self.dpi, layout=manual_layout())
             fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         return fig, ax
 
@@ -1372,7 +1521,8 @@ class FigureComposer:
         fig_w = self.width_cm / 2.54
         fig_h = self.height_cm / 2.54
 
-        fig = plt.figure(figsize=(fig_w, fig_h), dpi=self.dpi)
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=self.dpi,
+                         layout=manual_layout())
         axes = render_panels_to_figure(
             self.panels, self.grid_rows, self.grid_cols, fig,
             label_font_size=self.label_font_size,
@@ -1564,7 +1714,9 @@ class FigureComposer:
 
         Sets the linewidth of every ``Line2D`` data line to
         ``self.line_linewidth``.  Tick lines, spines, and patch edges are
-        excluded (those are controlled by :meth:`normalize_spines`).
+        excluded (those are controlled by :meth:`normalize_spines`), as is
+        anything tagged with :func:`exempt_from_linewidth_normalization` --
+        use that for a raster or a cartoon whose stroke weights are their own.
 
         Only acts when *line_linewidth* was supplied to the constructor;
         if it is ``None`` this method is a no-op so existing figures are
@@ -1587,7 +1739,14 @@ class FigureComposer:
         lw = self.line_linewidth
 
         def _apply(ax):
+            # An exempt axes keeps its authored widths wholesale, children too:
+            # a raster or a cartoon is a unit, and normalising half of it would
+            # look worse than normalising none.
+            if getattr(ax, NO_LINEWIDTH_NORMALIZE, False):
+                return
             for line in ax.get_lines():
+                if getattr(line, NO_LINEWIDTH_NORMALIZE, False):
+                    continue
                 line.set_linewidth(lw)
             for child in getattr(ax, 'child_axes', []):
                 _apply(child)
@@ -1666,7 +1825,7 @@ class FigureComposer:
             if base is None:
                 ax._sciplotlib_fit_base = tuple(ax.get_position().bounds)
             else:
-                ax.set_position(list(base))
+                set_position_keeping_layout_flag(ax, list(base))
 
         gs_kwargs = dict(wspace=self._wspace, hspace=self._hspace)
         if self.margins is not None:
@@ -1686,6 +1845,8 @@ class FigureComposer:
                 if not label or label not in self._axes:
                     continue
                 if p.get('axes_pad') is not None and p['axes_pad'] == {}:
+                    continue
+                if p.get('fit_exempt'):
                     continue
 
                 ax = self._axes[label]
@@ -1710,7 +1871,7 @@ class FigureComposer:
                 if dl + db + dr + dt < 1e-6:
                     continue
 
-                ax.set_position([
+                set_position_keeping_layout_flag(ax, [
                     pos.x0 + dl, pos.y0 + db,
                     pos.width - dl - dr, pos.height - db - dt,
                 ])
@@ -1724,6 +1885,8 @@ class FigureComposer:
             label = p.get('label', '')
             if not label or label not in self._axes:
                 continue
+            if p.get('fit_exempt'):
+                continue
             row_groups[(p['row'], p['row'] + p['rowspan'])].append(label)
 
         for row_labels in row_groups.values():
@@ -1734,7 +1897,8 @@ class FigureComposer:
             min_y1 = min(p.y0 + p.height for p in positions)
             for l in row_labels:
                 pos = self._axes[l].get_position()
-                self._axes[l].set_position([pos.x0, max_y0, pos.width, min_y1 - max_y0])
+                set_position_keeping_layout_flag(
+                    self._axes[l], [pos.x0, max_y0, pos.width, min_y1 - max_y0])
 
         # Align panels that share the same grid column extent to the same x0.
         # Group by (start_col, end_col) so panels with different colspans that happen
@@ -1743,6 +1907,8 @@ class FigureComposer:
         for p in self.panels:
             label = p.get('label', '')
             if not label or label not in self._axes:
+                continue
+            if p.get('fit_exempt'):
                 continue
             ax = self._axes[label]
             if not ax.axison:
@@ -1757,12 +1923,23 @@ class FigureComposer:
             for l in col_labels:
                 pos = self._axes[l].get_position()
                 dx = max_x0 - pos.x0
-                self._axes[l].set_position([max_x0, pos.y0, pos.width - dx, pos.height])
+                set_position_keeping_layout_flag(
+                    self._axes[l], [max_x0, pos.y0, pos.width - dx, pos.height])
 
         # Hand-tuned panel positions are deltas against the layout just
         # computed, so they land last — after the row/column alignment passes
         # above, which would otherwise undo them.
         self._apply_deferred_overrides()
+
+        # Every panel now has its final box. Content laid out against that box
+        # (wrapped text, most obviously) is still sized for the box it had
+        # before, so re-run any redraw hooks. Without this an override nudged
+        # in the editor reflows on screen but not in the saved file.
+        for ax in fig.get_axes():
+            try:
+                run_redraw_hook(ax)
+            except Exception as exc:      # a bad hook must not block a save
+                print(f'Redraw hook failed on {ax}: {exc}')
 
     def _apply_deferred_overrides(self, verbose=None):
         """Apply the override kinds that must run after :meth:`fit_axes_to_cells`.
@@ -1777,8 +1954,14 @@ class FigureComposer:
         from sciplotlib import overrides as _ov
         if verbose is None:
             verbose = getattr(self, '_overrides_verbose', True)
-        return _ov.apply_overrides(self._fig, self._overrides_path,
-                                   verbose=verbose, kinds=_ov.DEFERRED_KINDS)
+        applied, warns = _ov.apply_overrides(
+            self._fig, self._overrides_path, verbose=verbose,
+            kinds=_ov.DEFERRED_KINDS)
+        # The layout is final only now, so this is the first moment a child
+        # override can be judged against where its panel actually ended up.
+        warns = warns + _ov.check_child_overrides(
+            self._fig, self._overrides_path, verbose=verbose)
+        return applied, warns
 
     def compose_image(self, wspace=None, hspace=None, clip_panels=True, width=None, **kwargs):
         """Compose the figure and return it as a marimo-compatible HTML image.
@@ -1849,8 +2032,9 @@ class FigureComposer:
         print(code)
         return code
 
-    def launch_editor(self, patch_types=None, overrides_path=None, screen_dpi=100,
-                      include_panels=True, snap=True, editor='panel'):
+    def launch_editor(self, patch_types=None, overrides_path=None, screen_dpi=None,
+                      include_panels=True, snap=True, editor='panel',
+                      fit_min_dpi=None):
         """Normalize the figure and open an interactive position editor.
 
         Applies :meth:`normalize_fonts`, :meth:`fit_axes_to_cells` and
@@ -1891,9 +2075,18 @@ class FigureComposer:
             Allow panel axes to be moved and resized.
         snap : bool
             Snap a dragged axes edge onto a neighbouring panel's edge.
-        screen_dpi : float
+        screen_dpi : float, optional
             Render dpi for the on-screen preview. Positions are relative, so
-            this changes nothing but the size of the preview.
+            this changes nothing but the size of the preview. Left unset, the
+            tk editor sizes the preview to the window ('fit'), which is the
+            only workable choice for a poster -- an A0 canvas at 150 dpi is a
+            7000 x 5000 px backdrop. Pass a number to pin it; the editor's
+            zoom box then takes any dpi you type.
+        fit_min_dpi : float, optional
+            Lowest dpi 'fit' may shrink to before it stops and lets the canvas
+            scroll instead (tk editor only). Fitting a whole A0 into a window
+            lands near 35 dpi, where the text is unreadable. Defaults to
+            :attr:`~sciplotlib.panel_editor.PanelEditor.MIN_FIT_DPI`.
         """
         if self._fig is None:
             raise RuntimeError("Call compose() and plot all panels before launch_editor().")
@@ -1904,15 +2097,22 @@ class FigureComposer:
 
         if editor == 'panel':
             from sciplotlib.panel_editor import launch_panel_editor
+            # screen_dpi is passed through as given. It used to be raised to
+            # a floor of 150, which silently ignored any smaller number asked
+            # for -- on a poster the useful range is well below that.
+            view_dpi = 'fit' if screen_dpi is None else screen_dpi
             launch_panel_editor(self._fig, overrides_path=overrides_path,
-                                view_dpi=max(screen_dpi, 150), snap=snap)
+                                view_dpi=view_dpi, snap=snap,
+                                fit_min_dpi=fit_min_dpi)
             return
         if editor != 'mpl':
             raise ValueError(f"editor must be 'panel' or 'mpl', got {editor!r}")
 
         from sciplotlib.drag_editor import launch_editor as _launch
         kw = {} if patch_types is None else {'patch_types': patch_types}
-        _launch(self._fig, overrides_path=overrides_path, screen_dpi=screen_dpi,
+        # The matplotlib editor has no fit mode; it needs a concrete dpi.
+        _launch(self._fig, overrides_path=overrides_path,
+                screen_dpi=100 if screen_dpi is None else screen_dpi,
                 include_panels=include_panels, snap=snap, **kw)
 
     def launch_editor_panel(self, label, plot_func=None, patch_types=None,
@@ -2148,6 +2348,85 @@ class FigureComposer:
             splcollide.save_collision_overlay(self._fig, collisions, overlay_path)
         return collisions
 
+    def check_clipping(self, verbose=True, limit=None, **kwargs):
+        """Report panel data drawn outside its axes, i.e. silently cut off.
+
+        Matplotlib clips to the axes, so a point past ``ylim`` just disappears:
+        nothing warns you, and the saved figure shows a truncated distribution.
+        That bites when limits are hard-coded and the data later grows — an
+        extra mouse, another session. Findings are reported against the panel
+        label they belong to, like :meth:`check_layout`.
+
+        Call after composing and plotting every panel::
+
+            fig, axes = composer.compose()
+            plot_panel_a(axes['a'])            # ... all panels
+            composer.check_clipping()
+
+        Parameters
+        ----------
+        verbose : bool
+            Print the report.
+        limit : int, optional
+            Print at most this many findings (all are returned).
+        **kwargs
+            Passed to :func:`~sciplotlib.collide.find_clipped_data`
+            (``tol_frac``, ``include_insets``).
+
+        Returns
+        -------
+        list of :class:`~sciplotlib.collide.ClippedData`
+            Sorted worst-first; empty when nothing is cut off.
+        """
+        if self._fig is None:
+            raise RuntimeError("Call compose() before check_clipping().")
+        import sciplotlib.collide as splcollide
+
+        findings = splcollide.find_clipped_data(
+            self._fig, axes=self.axes, **kwargs)
+        if verbose:
+            print(splcollide.format_clipped_data(findings, limit=limit))
+        return findings
+
+    def check_crowding(self, verbose=True, limit=None, **kwargs):
+        """Report panel data pressed up against its axes limits.
+
+        The companion to :meth:`check_clipping`. Clipping loses the data;
+        crowding keeps it but paints it over the spine, so a near-zero value
+        reads as sitting *on* the axis and its error bar is unreadable. The
+        usual fix is to let the view run past the data and clip the spine back::
+
+            ax.set_ylim(-0.025, 0.32)
+            ax.spines['left'].set_bounds(0, 0.32)
+
+        which keeps the axis reading from zero while giving the points room.
+
+        Parameters
+        ----------
+        verbose : bool
+            Print the report.
+        limit : int, optional
+            Print at most this many findings (all are returned).
+        **kwargs
+            Passed to :func:`~sciplotlib.collide.find_crowded_data`
+            (``margin_pt``, ``edges``, ``include_insets``). Only the y edges
+            are checked by default; see that function for why.
+
+        Returns
+        -------
+        list of :class:`~sciplotlib.collide.CrowdedData`
+            Sorted worst-first; empty when nothing is crowded.
+        """
+        if self._fig is None:
+            raise RuntimeError("Call compose() before check_crowding().")
+        import sciplotlib.collide as splcollide
+
+        findings = splcollide.find_crowded_data(
+            self._fig, axes=self.axes, **kwargs)
+        if verbose:
+            print(splcollide.format_crowded_data(findings, limit=limit))
+        return findings
+
     def save(self, path, formats=('pdf', 'svg'), dpi=None, transparent=True,
              bbox_inches='standard', check_layout=True, min_gap_pt=1.0):
         """Save the composed figure to one or more file formats.
@@ -2155,8 +2434,17 @@ class FigureComposer:
         Parameters
         ----------
         check_layout : bool, default True
-            Run :meth:`check_layout` first and print any overlapping or
-            cut-off artists.  Advisory only -- the figure is saved either way.
+            Run :meth:`check_layout` first.  Advisory only -- the figure is
+            saved either way -- but the findings are not left in the console
+            alone, where a batch render's other output buries them:
+
+            * ``<path>-layout.txt`` is always written, and says ``clean``
+              when there is nothing to report, so a script can read it;
+            * ``<path>-layout.png`` boxes each finding in red, numbered as in
+              the report.  It is deleted on a clean save, so a stale overlay
+              never contradicts the report next to it;
+            * :attr:`layout_findings` holds the list.
+
             Set False to skip the check (it costs a couple of extra draws).
         min_gap_pt : float, default 1.0
             Minimum separation enforced by that check, in points.  Pass ``0.0``
@@ -2178,16 +2466,13 @@ class FigureComposer:
         self.fit_axes_to_cells()
         self.normalize_spines()
 
-        if check_layout:
-            # after normalisation, so what is checked is what is saved
-            try:
-                self.check_layout(min_gap_pt=min_gap_pt, limit=15)
-            except Exception as exc:      # never let a check block a save
-                print(f'Layout check skipped: {exc}')
-
         dpi = dpi or self.dpi
         p = Path(path).with_suffix('')
         p.parent.mkdir(parents=True, exist_ok=True)
+
+        if check_layout:
+            # after normalisation, so what is checked is what is saved
+            self._write_layout_report(p, min_gap_pt)
 
         # savefig(bbox_inches=None) falls back to rcParams['savefig.bbox'],
         # which stylesheets may set to 'tight'; force it through the rcParam
@@ -2200,6 +2485,29 @@ class FigureComposer:
                     kwargs['transparent'] = transparent
                 self._fig.savefig(save_path, **kwargs)
                 print(f"Saved: {save_path}")
+
+    def _write_layout_report(self, stem, min_gap_pt):
+        """Run the layout check and leave its findings next to the figure."""
+        import sciplotlib.collide as splcollide
+
+        report_path = stem.with_name(f'{stem.name}-layout.txt')
+        overlay_path = stem.with_name(f'{stem.name}-layout.png')
+        try:
+            findings = self.check_layout(min_gap_pt=min_gap_pt, limit=15)
+        except Exception as exc:          # never let a check block a save
+            print(f'Layout check skipped: {exc}')
+            self.layout_findings = None
+            report_path.write_text(f'Layout check skipped: {exc}\n')
+            overlay_path.unlink(missing_ok=True)
+            return
+        self.layout_findings = findings
+        report_path.write_text(splcollide.format_collisions(
+            findings, min_gap_pt=min_gap_pt) + '\n')
+        if findings:
+            splcollide.save_collision_overlay(self._fig, findings, overlay_path)
+            print(f'Layout findings: {report_path}')
+        else:
+            overlay_path.unlink(missing_ok=True)
 
     @classmethod
     def from_yaml(cls, filepath, **overrides):

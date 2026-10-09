@@ -271,3 +271,96 @@ def test_overrides_as_code_emits_every_kind():
     assert 'set_zoom(0.3000)' in code
     assert "texts[0].set_position((0.1000, 0.1000))" in code
     assert '_colorbar' in code
+
+
+def test_check_child_overrides_flags_an_inset_left_behind(tmp_path):
+    """An 'axes' override is absolute, so it does not follow its panel."""
+    import matplotlib.pyplot as plt
+    from sciplotlib import overrides as ov
+    from sciplotlib.compose import FigureComposer
+
+    c = FigureComposer(width_cm=10, height_cm=6, grid_rows=2, grid_cols=1, dpi=100)
+    c.add_panel('a', 0, 0, 1, 1)
+    fig, axes = c.compose()
+    inset = axes['a'].inset_axes([0.1, 0.1, 0.3, 0.3])
+    c.fit_axes_to_cells()
+
+    path = tmp_path / 'o.json'
+    # An override recorded when the panel was somewhere else entirely.
+    ov.write_overrides(path, {'panel:a/inset:0': {
+        'kind': 'axes', 'fingerprint': None, 'value': [0.80, 0.02, 0.1, 0.1]}})
+    ov.apply_overrides(fig, path, verbose=False)
+
+    warns = ov.check_child_overrides(fig, path, verbose=False)
+    assert len(warns) == 1
+    assert 'outside panel' in warns[0]
+    assert "'a'" in warns[0]
+    plt.close(fig)
+
+
+def test_check_child_overrides_is_quiet_when_the_inset_is_on_its_panel(tmp_path):
+    import matplotlib.pyplot as plt
+    from sciplotlib import overrides as ov
+    from sciplotlib.compose import FigureComposer
+
+    c = FigureComposer(width_cm=10, height_cm=6, grid_rows=2, grid_cols=1, dpi=100)
+    c.add_panel('a', 0, 0, 1, 1)
+    fig, axes = c.compose()
+    inset = axes['a'].inset_axes([0.1, 0.1, 0.3, 0.3])
+    c.fit_axes_to_cells()
+    box = inset.get_position()
+
+    path = tmp_path / 'o.json'
+    ov.write_overrides(path, {'panel:a/inset:0': {
+        'kind': 'axes', 'fingerprint': None,
+        'value': [box.x0 + 0.005, box.y0, box.width, box.height]}})
+    ov.apply_overrides(fig, path, verbose=False)
+    assert ov.check_child_overrides(fig, path, verbose=False) == []
+    plt.close(fig)
+
+
+# ── deletion ───────────────────────────────────────────────────────────────
+
+def test_deleted_entry_hides_the_artist(tmp_path):
+    """A `deleted` flag hides its target rather than moving it."""
+    c = _composer()
+    fig, axes = _draw(c)
+    addr = 'panel:a/text:0'
+    kind, target, _ = ov.resolve(fig, addr, fingerprint='MP computer')
+    assert target.get_visible()
+
+    path = tmp_path / 'ov.json'
+    ov.write_overrides(path, {addr: {'kind': 'text', 'value': [0.2, 0.8],
+                                     'fingerprint': 'MP computer',
+                                     'deleted': True}})
+    applied, warns = ov.apply_overrides(fig, path, verbose=False)
+    assert applied == 1 and not warns
+    assert not target.get_visible()
+
+
+def test_deleted_panel_hides_the_whole_axes(tmp_path):
+    c = _composer()
+    fig, axes = _draw(c)
+    path = tmp_path / 'ov.json'
+    ov.write_overrides(path, {'panel:b': {'kind': 'panel',
+                                          'value': [0, 0, 0.1, 0.1],
+                                          'delta': [0, 0, 0, 0],
+                                          'deleted': True}})
+    ov.apply_overrides(fig, path, verbose=False)
+    assert not axes['b'].get_visible()
+    assert axes['a'].get_visible()      # its neighbours are untouched
+
+
+def test_position_override_does_not_reveal_a_hidden_artist(tmp_path):
+    """Moving something must not un-hide it: the figure may have hidden it."""
+    c = _composer()
+    fig, axes = _draw(c)
+    kind, target, _ = ov.resolve(fig, 'panel:a/text:1', fingerprint='bandit')
+    target.set_visible(False)           # hidden by the figure, not the editor
+
+    path = tmp_path / 'ov.json'
+    ov.write_overrides(path, {'panel:a/text:1': {
+        'kind': 'text', 'value': [0.3, 0.3], 'fingerprint': 'bandit'}})
+    ov.apply_overrides(fig, path, verbose=False)
+    assert not target.get_visible()
+    assert tuple(target.get_position()) == (0.3, 0.3)

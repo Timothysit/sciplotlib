@@ -174,9 +174,10 @@ colorbars via `set_position` (the inset locator is detached so the move sticks).
   for a remote/headless marimo (that's the inherent limit of `plt.show()`).
 - In marimo the launching **cell blocks until you close the window**, and the
   editor's messages print to the **terminal running marimo**, not the cell.
-- The editor renders at `screen_dpi` (default 100), not the figure's print dpi
+- The editor renders the preview at its own dpi, not the figure's print dpi
   (e.g. 600), so the window fits the screen. Coordinates are all relative, so
-  this never changes the saved override values. Pass `screen_dpi=` to resize.
+  this never changes the saved override values. The tk editor defaults to
+  **fit-to-window**; pass `screen_dpi=` to pin a number instead.
 - Two figure-lifecycle facts the editor handles for you: marimo detaches figures
   from pyplot after each cell (the editor re-attaches a manager so the window
   opens), and colorbars made with `ax.inset_axes` carry a locator that would
@@ -189,6 +190,205 @@ colorbars via `set_position` (the inset locator is detached so the move sticks).
   `composer.print_overrides_as_code(path)` prints the equivalent explicit
   `set_label_coords` / `set_position` calls; paste them into the compose cell
   (where `axes` is in scope, replacing `apply_overrides`) and delete the JSON.
+
+---
+
+## Posters — `sciplotlib.poster.PosterComposer`
+
+A poster is a figure, so `PosterComposer` **subclasses `FigureComposer`**: the
+grid, the normalisation passes, the editor, overrides and the layout checker all
+work unchanged. It adds scale and chrome.
+
+```python
+import sciplotlib.poster as splposter
+
+poster = splposter.PosterComposer(paper='a0_landscape',   # 118.9 x 84.1 cm
+                                  grid_rows=48, grid_cols=72)
+poster.apply_style()
+poster.add_title('Title', authors='A, B & C', affiliations='SWC, UCL',
+                 row=0, rowspan=7, left_logo='logo.png')
+poster.add_section('intro', row=7, col=0, rowspan=41, colspan=18,
+                   title='Background')
+poster.add_panel('a', row=1, col=1, rowspan=12, colspan=16,   # RELATIVE to
+                 section='intro', plot_func=draw_task)        # the section body
+poster.add_text_block('take', row=14, col=1, rowspan=5, colspan=16,
+                      section='intro',
+                      bullets=['One takeaway.', 'Another.'])
+fig, axes = poster.compose()
+poster.save('figures/poster')
+```
+
+- **`paper=`** keys `PAPER_DIMENSIONS`: `a0_portrait/landscape`, `a1_*`, `a2_*`,
+  `a4`, `16:9_monitor`. Or pass `width_cm`/`height_cm`.
+- **`type_scale`** defaults to `width_cm / 118.9`, i.e. **1.0 on A0 landscape**,
+  and multiplies every type size and line weight (`POSTER_TYPE_SIZES`,
+  `POSTER_LINE_SIZES` — 20 pt body, 40 pt section titles, 76 pt poster title).
+  Any explicit `font_size=` etc. still wins.
+- **`add_section(name, ...)`** draws a titled block. `header_style='bar'`
+  (filled strip), `'plain'` (title + rule) or `'none'`. `header_rows` defaults
+  to whatever fits the title. `section_body(name)` returns the cells below the
+  header.
+- **`section='name'` on `add_panel`/`add_text_block`** makes `row`/`col`
+  relative to that section's body, and **warns** if the panel overflows it.
+- **`add_text_block`** wraps prose to the panel width using real font metrics
+  (`wrap_text_to_width`), and handles bulleted lists with hanging indents. The
+  panel is `no_label=True, no_axis=True, fit_exempt=True`.
+- **`theme=`** is `'light'`, `'dark'`, `'plain'` (rules only, no blocks), or a
+  dict merged over `'light'`.
+
+### A reversed (dark) title banner with logos
+
+```python
+poster.add_title(title, authors=..., affiliations=...,
+                 row=0, rowspan=7,
+                 band_facecolor='black', rule=False,
+                 left_logo='parts/swc-logo.png',  left_logo_tint='white',
+                 right_logo='parts/ucl-logo.png', right_logo_tint='white',
+                 logo_height_frac=0.42, logo_pad_cm=2.0)
+```
+
+- A **dark `band_facecolor` flips the text automatically**: title and authors to
+  white, affiliations to a light grey. The theme's muted grey (`#444`) would be
+  invisible on black. Explicit `color=` / `affiliations_color=` still win.
+- **`full_bleed`** defaults to True whenever `band_facecolor` is set, so the band
+  runs to the paper edges; only the bottom edge stays on the grid, so the
+  sections butt up against it. An unfilled title area stays aligned with the
+  columns instead.
+- **`*_logo_tint`** recolours a logo's opaque pixels — the standard reversed-mono
+  treatment for a dark logo on a dark band. It **requires an alpha channel**
+  (tinting an opaque JPEG would flood the whole rectangle) and warns instead if
+  there isn't one. It flattens a multi-colour mark to one colour, so check it
+  against the institution's own reversed asset before printing.
+- A **missing or unreadable logo warns and is skipped**, so the render still
+  completes — check the log before sending anything to a printer.
+- **`poster.describe()`** prints the structure — worth calling when the layout
+  is too big to hold in your head.
+- **Section frames are checked by the layout checker.** A frame is a boundary:
+  content belongs inside it and must not cross its stroke. Ordinary patches are
+  opt-in (`'patch'` is not in `DEFAULT_KINDS`) because bar charts and shaded
+  regions would flood the report, so frames get their own kind, `'section'`,
+  which *is* in the defaults. Only **unfilled** frames are tagged — the checks
+  are ink-based, and a filled frame inks its whole interior, so every panel
+  inside it would register as a collision. Text merely sitting inside a frame is
+  never reported; only ink that crosses the stroke is.
+
+### Three `FigureComposer` features posters added, useful anywhere
+
+- **`add_panel(..., fit_exempt=True)`** — `fit_axes_to_cells` skips this panel in
+  the shrink pass *and* in the row/column alignment passes. Use it for any panel
+  positioning its content in axes fractions (text, a full-bleed image, a
+  hand-placed schematic); otherwise the row-alignment pass resizes the axes and
+  drags the content with it.
+- **`add_panel(..., no_label=True)`** — no panel letter, but the label is still
+  the `axes` dict key.
+- **`exempt_from_linewidth_normalization(line_or_axes)`** — `normalize_linewidths`
+  sets *every* `Line2D` to one width, which is wrong for anything whose stroke
+  weight is its own: a raster of one short line per trial, a hand-drawn cartoon.
+  On a poster the mismatch is stark — a 2.5 pt house width turns a 200-trial
+  choice raster into a solid block. Tagging an Axes exempts its lines and its
+  child axes. (Same idea as `exempt_from_font_normalization`, and they compose:
+  the two use different attributes, so tagging one does not clear the other.)
+
+### Redraw hooks — `set_redraw_hook` / `run_redraw_hook`
+
+Content laid out *against* the axes size (wrapped text, above all) has to be
+rebuilt when a panel is resized. Register how:
+
+```python
+from sciplotlib.compose import set_redraw_hook
+
+def _draw_caption(ax, text, fontsize):     # MODULE-LEVEL, plain args
+    ax.clear(); ax.set_axis_off()
+    ax.text(0, 1, wrap(text, ax), fontsize=fontsize, va='top')
+
+set_redraw_hook(ax, _draw_caption, text=caption, fontsize=9)
+```
+
+It **must** be a module-level function taking picklable data — the editor runs
+in a subprocess on a pickled figure, and a closure would not survive the trip.
+Hooks are run by `fit_axes_to_cells` (so saves match what you edited) and by the
+editor's **reflow** toggle on every move/resize.
+
+---
+
+## Slides — `sciplotlib.slides.SlideComposer` / `SlideDeck`
+
+A slide is a figure, so `SlideComposer` **subclasses `PosterComposer`**: the
+grid, normalisation, editor, overrides, layout checker, `add_text_block` and the
+themes all work unchanged. `SlideDeck` renders a sequence of slides into one
+multi-page PDF.
+
+```python
+import sciplotlib.slides as splslides
+
+deck = splslides.SlideDeck(paper='slide_16x9', theme='light',
+                           stylesheet='mp-paper', footer='S4SN 2026',
+                           first_number=8)
+
+@deck.slide(title='DA tracks reward, NE does not', stages=2,
+            notes='Land the timing difference here.')
+def encoding(slide, stage):
+    slide.add_image('model', row=0, col=0, rowspan=18, colspan=16,
+                    file='parts/regression-model.png')
+    if stage >= 1:
+        slide.add_bullets('take', row=2, col=18, rowspan=12, colspan=14,
+                          bullets=['One takeaway.', 'Another.'])
+
+deck.save('figures/talk')            # figures/talk.pdf, 2 pages
+deck.save_notes('figures/talk-notes')
+```
+
+- **`paper=`** is `slide_16x9` (33.867 × 19.05 cm = **exactly 13.333 × 7.5 in**,
+  PowerPoint widescreen), `slide_16x10` (Keynote) or `slide_4x3`. The exact size
+  is the point: a deck concatenated with a collaborator's PowerPoint export must
+  not be rescaled, which would rescale every font in it.
+- **`stages=N`** renders the slide N times with `stage` counting `0..N-1`, one
+  PDF page each — that is how a PDF deck does a progressive reveal, and how
+  Beamer overlays work underneath. **The builder runs fresh each time**, so
+  build the whole slide every call and gate later content behind `stage`.
+- **Builder arity is detected**: `f(slide)` or `f(slide, stage)`. If the builder
+  calls `compose()` itself (the marimo pattern), the deck does not re-compose.
+- **`first_number=`** sets the number the first slide carries, for a deck that
+  starts partway through someone else's. Build stages share one number.
+- **Type sizes** come from `SLIDE_TYPE_SIZES` (14 pt ticks, 20 pt body, 28 pt
+  title), scaled by `type_scale = width_cm / 33.867`. Poster defaults calibrated
+  for A0 never leak in.
+- **`notes=`** never appears in the PDF — a PDF has nowhere to put it. It goes
+  to `save_notes()`.
+
+### Three things that differ from every other composer
+
+- **`add_panel(..., ticks=True)` is the default.** `render_panels_to_figure`
+  hands every fresh panel `tick_params(bottom=False, left=False,
+  labelbottom=False, labelleft=False)`, so a paper-figure panel function must
+  re-enable them by hand (`panels/_shared.py:show_ticks` in the matchingp repo
+  exists for exactly this). A deck is dozens of small panel functions and a
+  silently unlabelled axis is easy to miss on a projector, so slides re-enable
+  first and let the plot function override. Pass `ticks=False` for the old
+  behaviour; `ax.axis('off')` needs neither.
+- **The title band and footer are reserved out of the canvas**, not out of the
+  grid. `row=0` is the top of the *content*, so no panel can land under the
+  title. Height is fixed at construction (`title_cm`) because the grid margins
+  derive from it — a long title therefore **wraps and then shrinks** rather than
+  growing down over the first row.
+- **`save()` applies the stylesheet before opening the PDF.** matplotlib reads
+  `pdf.fonttype` once, when `PdfPages` is constructed, not per page.
+
+### Gotchas
+
+**Title wrapping is measured in the drawn weight.** A bold string is ~10% wider
+than its regular counterpart — enough for a title wrapped against regular
+metrics to still run off the page. `_fit_title` passes a `FontProperties` with
+the weight; do the same for any other chrome you add.
+
+**`normalize_fonts` still flattens in-panel text.** Any panel whose type sizes
+are part of its design — an equation slide, a hand-laid table — must call
+`exempt_from_font_normalization(ax)`, exactly as for a schematic in a paper
+figure. The symptom is a 30 pt equation silently rendering at `font_size`.
+
+**A slide with a `set_title` panel wants `row=1`, not `row=0`.** The axes title
+draws above the axes and lands on the title rule otherwise. `check_layout()`
+catches it — `save()` runs the check on every page by default.
 
 ---
 

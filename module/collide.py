@@ -55,11 +55,35 @@ __all__ = [
     'allow_overlap',
     'save_collision_overlay',
     'NO_COLLISION_CHECK',
+    'ClippedData',
+    'find_clipped_data',
+    'format_clipped_data',
+    'check_clipping',
+    'exempt_from_clip_check',
+    'NO_CLIP_CHECK',
+    'CrowdedData',
+    'find_crowded_data',
+    'format_crowded_data',
+    'check_crowding',
 ]
 
 
 NO_COLLISION_CHECK = '_spl_no_collision_check'
 """Attribute name set on artists that :func:`find_collisions` skips."""
+
+POSTER_SECTION_ATTR = '_sciplotlib_poster_section'
+"""Attribute :class:`~sciplotlib.poster.PosterComposer` sets on a section frame.
+
+A frame is a boundary rather than content: panels and text belong *inside* it
+and must not cross its stroke.  Ordinary patches are opt-in for the layout
+checks (``'patch'`` is not in :data:`DEFAULT_KINDS`) because bar charts and
+shaded regions would flood the report, but a tagged frame is checked by
+default under its own kind, ``'section'``.
+
+Only *unfilled* frames carry the tag.  The checks are ink-based, so a filled
+frame would ink its whole interior and every panel inside it would register as
+a collision.
+"""
 
 _ALLOWED_PAIRS = '_spl_overlap_allowed'
 
@@ -107,7 +131,10 @@ class Collision:
         ``'too-close'``   -- ink is separated by less than ``min_gap_pt``;
         ``'outside-figure'`` -- the artist's ink extends past the canvas, so it
         is cropped in a fixed-size save;
-        ``'clipped'``     -- the artist is clipped by its own axes clip box.
+        ``'clipped'``     -- the artist is clipped by its own axes clip box;
+        ``'short-leader'`` -- an annotation's leader is shorter than its
+        ``shrinkA + shrinkB``, so matplotlib ignored the shrink and drew it
+        right onto its target point.
     gap_pt : float
         Distance between the two artists' ink, in points.  ``0.0`` for an
         overlap.
@@ -138,7 +165,7 @@ class Collision:
         """Sort key: overlaps first (largest area), then the tightest gaps."""
         if self.kind == 'overlap':
             return (0, -self.overlap_pt2)
-        if self.kind in ('outside-figure', 'clipped'):
+        if self.kind in ('outside-figure', 'clipped', 'short-leader'):
             return (1, -self.overlap_pt2)
         return (2, self.gap_pt)
 
@@ -152,6 +179,8 @@ class Collision:
             what = (f"{self.a_desc} is {self.gap_pt:.2f} pt from {self.b_desc}")
         elif self.kind == 'outside-figure':
             what = f"{self.a_desc} extends outside the figure ({self.b_desc})"
+        elif self.kind == 'short-leader':
+            what = f"{self.a_desc} {self.b_desc}"
         else:
             what = f"{self.a_desc} is clipped by {self.b_desc}"
         tail = f"  ->  {self.suggestion}" if self.suggestion else ''
@@ -174,11 +203,16 @@ class _Ink:
     mask: object = None              # bool array, rows top-down in canvas px
     r0: int = 0                      # canvas row of mask[0, 0]
     c0: int = 0                      # canvas col of mask[0, 0]
+    canvas_h: int = 0                # canvas height the mask was drawn on
     panel: str = ''
     descendants: frozenset = frozenset()
     clipped_px: float = 0.0          # ink lost to the artist's own clip box
     clipped_side: str = ''
     edge_side: str = ''              # canvas edge the painted ink runs into
+    draw: object = None              # draw(renderer) override; None -> artist.draw
+    target_ids: frozenset = frozenset()  # a leader's target artists (may touch)
+    target_px: tuple = None          # a leader's target point, display px
+    target_radius_px: float = 0.0    # ink this close to target_px is exempt
 
 
 def _shorten(text, n=28):
@@ -225,6 +259,10 @@ def _artist_kind(artist):
     if isinstance(artist, mcoll.Collection):
         return 'line'
     if isinstance(artist, Patch):
+        # A poster section frame is a patch, but unlike an ordinary one it is a
+        # boundary that content must not cross, so it is checked by default.
+        if getattr(artist, POSTER_SECTION_ATTR, None) is not None:
+            return 'section'
         return 'patch'
     return None
 
@@ -241,8 +279,13 @@ def _describe(artist, kind):
         return 'image'
     if kind == 'legend':
         return 'legend'
+    if kind == 'leader':
+        text = artist.get_text().strip()
+        return f'leader of "{_shorten(text)}"' if text else 'arrow'
     if kind == 'spine':
         return f'{getattr(artist, "spine_type", "?")} spine'
+    if kind == 'section':
+        return f'section frame {getattr(artist, POSTER_SECTION_ATTR, "?")!r}'
     if kind == 'line':
         from matplotlib.lines import Line2D
         label = artist.get_label() or ''
@@ -517,6 +560,11 @@ def _collect(fig, renderer, kinds, include, drawn_ids, skip_ids=()):
             continue
         seen.add(id(artist))
         kind = _artist_kind(artist)
+        if kind == 'text' and getattr(artist, 'arrow_patch', None) is not None:
+            if (artist.get_visible() and not getattr(artist, NO_COLLISION_CHECK, False)
+                    and (include is None or include(artist))):
+                out.extend(_annotation_items(artist, renderer, kinds, idx))
+            continue
         if kind is None or kind not in kinds:
             continue
         if _is_skippable(artist, kind):
@@ -561,12 +609,153 @@ def _collect(fig, renderer, kinds, include, drawn_ids, skip_ids=()):
     return [item for item in out if id(item.artist) not in nested]
 
 
+def _annotation_items(ann, renderer, kinds, idx):
+    """An Annotation with an arrow, as a ``'text'`` item and a ``'leader'`` item.
+
+    Checked as one artist, a leader reaching the marker it points at is
+    reported as the *text* overlapping that marker, with advice to move text
+    whose glyphs touch nothing.  Split, the text is judged on its glyphs and
+    the leader on its own terms: it may touch its target
+    (:func:`_leader_exempt`) and its own text, but not another label on the
+    way.  Both items keep the Annotation as their artist, so an exemption or an
+    ``allow_overlap`` on the Annotation covers its leader too.
+
+    The arrow patch is not in ``findobj()`` -- ``Annotation.get_children`` does
+    not list it -- so this is the only way the checks can see it at all.  That
+    includes an empty-text Annotation used purely as an arrow, which was
+    previously skipped as blank text.
+    """
+    import matplotlib.artist as martist
+    import matplotlib.text as mtext
+
+    items = []
+    fig = ann.get_figure()
+    px_per_pt = fig.dpi / 72.0
+    if 'text' in kinds and ann.get_text().strip():
+        try:
+            bb = mtext.Text.get_window_extent(ann, renderer)
+        except Exception:
+            bb = None
+        if bb is not None and bb.width > 0 and bb.height > 0:
+            items.append(_Ink(
+                artist=ann, kind='text', desc=_describe(ann, 'text'),
+                zorder=float(ann.get_zorder()), draw_index=idx,
+                bbox=(bb.x0, bb.y0, bb.x1, bb.y1),
+                raw_bbox=(bb.x0, bb.y0, bb.x1, bb.y1),
+                draw=lambda r, a=ann: _draw_without_arrow(a, r),
+            ))
+    arrow = ann.arrow_patch
+    if 'leader' in kinds and arrow.get_visible():
+        try:
+            bb = arrow.get_window_extent(renderer)
+        except Exception:
+            bb = None
+        if bb is not None and np.isfinite([bb.x0, bb.y0, bb.x1, bb.y1]).all():
+            pad = 0.5 * _stroke_width(arrow) * px_per_pt
+            raw = (bb.x0 - pad, bb.y0 - pad, bb.x1 + pad, bb.y1 + pad)
+            targets = set()
+            coords = ann.xycoords if isinstance(ann.xycoords, tuple) else (ann.xycoords,)
+            for c in coords:
+                if isinstance(c, martist.Artist):
+                    targets.update(id(x) for x in c.findobj())
+            items.append(_Ink(
+                artist=ann, kind='leader', desc=_describe(ann, 'leader'),
+                zorder=float(arrow.get_zorder()), draw_index=idx,
+                bbox=raw, raw_bbox=raw, draw=arrow.draw,
+                target_ids=frozenset(targets),
+                target_px=_leader_target_px(ann),
+                target_radius_px=(float(arrow.shrinkB) + 1.0) * px_per_pt,
+            ))
+    return items
+
+
+def _draw_without_arrow(ann, renderer):
+    """Draw an Annotation's text alone."""
+    arrow = ann.arrow_patch
+    visible = arrow.get_visible()
+    arrow.set_visible(False)
+    try:
+        ann.draw(renderer)
+    finally:
+        arrow.set_visible(visible)
+
+
+def _leader_target_px(ann):
+    """Display position of the point an Annotation's leader points at."""
+    try:
+        return tuple(float(v) for v in ann.arrow_patch._posA_posB[1])
+    except Exception:
+        pass
+    try:
+        return tuple(float(v) for v in ann._get_xy_display())
+    except Exception:
+        return None
+
+
+def _short_leader(ann, px_per_pt):
+    """Length in pt of a leader whose ``shrinkB`` matplotlib dropped, else None.
+
+    ``FancyArrowPatch`` shrinks the path by ``shrinkA``/``shrinkB`` points, but
+    when the path is shorter than their sum the shrink fails and is silently
+    skipped: the leader is drawn all the way onto its target point, which is
+    exactly what ``shrinkB`` was set to prevent.  The tell is the drawn path
+    ending on the target.
+    """
+    arrow = ann.arrow_patch
+    shrink_b = float(arrow.shrinkB or 0.0)
+    if shrink_b <= 0 or not arrow.get_visible():
+        return None
+    try:
+        paths, _ = arrow._get_path_in_displaycoord()
+        target = np.asarray(arrow._posA_posB[1], dtype=float)
+    except Exception:
+        return None
+    verts = np.concatenate([np.asarray(p.vertices, dtype=float) for p in paths])
+    if not len(verts):
+        return None
+    reach = np.min(np.hypot(*(verts - target).T))
+    if reach >= 0.5 * shrink_b * px_per_pt:
+        return None
+    start = np.asarray(paths[0].vertices[0], dtype=float)
+    return float(np.hypot(*(start - target))) / px_per_pt
+
+
+def _leader_exempt(leader, other, use_ink):
+    """True if ``other`` is what ``leader`` points at, so they may touch.
+
+    Either the Annotation was anchored to ``other`` itself (``xycoords`` is an
+    artist, e.g. a cross-panel arrow onto an axis label), or ``other`` has ink
+    at the leader's target point -- the marker a value label points to.  A
+    label the leader merely passes on its way has no ink there, so it is still
+    reported.
+    """
+    if id(other.artist) in leader.target_ids:
+        return True
+    if leader.target_px is None:
+        return False
+    tx, ty = leader.target_px
+    radius = leader.target_radius_px
+    if not use_ink or other.mask is None:
+        x0, y0, x1, y1 = other.bbox
+        return (x0 - radius <= tx <= x1 + radius) and (y0 - radius <= ty <= y1 + radius)
+    rows, cols = np.nonzero(other.mask)
+    if not rows.size:
+        return False
+    # masks are rows top-down from the canvas top; target is y-up display px
+    ys = other.canvas_h - (other.r0 + rows + 0.5)
+    xs = other.c0 + cols + 0.5
+    return bool(np.min(np.hypot(xs - tx, ys - ty)) <= radius)
+
+
 # ---------------------------------------------------------------------------
 # Ink masks
 # ---------------------------------------------------------------------------
 
-def _ink_mask(renderer, artist, alpha_threshold):
+def _ink_mask(renderer, artist, alpha_threshold, draw=None):
     """Draw one artist alone and return ``(mask, r0, c0)`` of its ink.
+
+    ``draw(renderer)`` replaces ``artist.draw`` when an item is only part of
+    its artist -- an Annotation's text without its leader, or the leader alone.
 
     ``mask`` is a cropped boolean array (rows top-down in canvas pixels) of the
     pixels whose alpha clears ``alpha_threshold``; ``r0``/``c0`` locate its
@@ -574,7 +763,7 @@ def _ink_mask(renderer, artist, alpha_threshold):
     nothing visible.
     """
     renderer.clear()
-    artist.draw(renderer)
+    (draw or artist.draw)(renderer)
     alpha = np.asarray(renderer.buffer_rgba())[:, :, 3]
     rows = np.flatnonzero(alpha.any(axis=1))
     if rows.size == 0:
@@ -615,13 +804,14 @@ def _render_masks(fig, items, alpha_threshold):
     kept = []
     for item in items:
         try:
-            ink = _ink_mask(renderer, item.artist, alpha_threshold)
+            ink = _ink_mask(renderer, item.artist, alpha_threshold, item.draw)
         except Exception:
             kept.append(item)             # keep it, compared by bbox
             continue
         if ink is None:
             continue                      # paints nothing -> nothing to hit
         item.mask, item.r0, item.c0 = ink
+        item.canvas_h = height
         h, w = item.mask.shape
         item.bbox = (float(item.c0), float(height - (item.r0 + h)),
                      float(item.c0 + w), float(height - item.r0))
@@ -699,7 +889,7 @@ def _measure_clipping(renderer, item, alpha_threshold, height):
             return                        # nothing sticks out to be clipped
     artist.set_clip_on(False)
     try:
-        ink = _ink_mask(renderer, artist, alpha_threshold)
+        ink = _ink_mask(renderer, artist, alpha_threshold, item.draw)
     except Exception:
         return
     finally:
@@ -841,9 +1031,12 @@ def _suggest(a_bbox, b_bbox, gap_px, px_per_pt):
 # Main entry points
 # ---------------------------------------------------------------------------
 
-DEFAULT_KINDS = ('text', 'image', 'line', 'spine')
+DEFAULT_KINDS = ('text', 'image', 'line', 'spine', 'section', 'leader')
 """Artist types checked by default: labels against each other and against the
 drawing -- curves, markers, axis spines.
+
+``'leader'`` is an Annotation's arrow, checked apart from its text: it may
+touch whatever it points at, but not a label it crosses on the way.
 
 Drawn shapes (``'patch'``), area fills and meshes (``'fill'``) are opt-in.
 Writing a label across a shape, a pale error band or a heatmap cell is ordinary
@@ -1010,6 +1203,28 @@ def find_collisions(fig, min_gap_pt=1.0, kinds=DEFAULT_KINDS,
                     bbox_px=item.bbox,
                 ))
 
+        for item in collected:
+            if item.kind != 'leader':
+                continue
+            length = _short_leader(item.artist, px_per_pt)
+            if length is None:
+                continue
+            arrow = item.artist.arrow_patch
+            need = float(arrow.shrinkA or 0.0) + float(arrow.shrinkB or 0.0)
+            x0, y0, x1, y1 = item.bbox
+            collisions.append(Collision(
+                kind='short-leader', a=item.artist, b=None,
+                a_desc=item.desc,
+                b_desc=(f'spans {length:.1f} pt, less than shrinkA + shrinkB '
+                        f'= {need:g} pt, so shrinkB was ignored and it is '
+                        'drawn onto its target'),
+                panel=item.panel, overlap_pt2=need - length,
+                suggestion=f'lengthen it to > {need:g} pt or lower shrinkB',
+                xy_fig=((x0 + x1) / 2 / fig_w, (y0 + y1) / 2 / fig_h),
+                bbox_fig=(x0 / fig_w, y0 / fig_h, x1 / fig_w, y1 / fig_h),
+                bbox_px=item.bbox,
+            ))
+
         search_px = min_gap_px + 2.0
         canvas_h = int(np.ceil(fig.bbox.height))
         for i, a in enumerate(items):
@@ -1044,9 +1259,15 @@ def _is_own_furniture(a, b, tick_labels, furniture):
 def _pair_collision(a, b, min_gap_px, search_px, px_per_pt, use_ink,
                     ignore_contained, fig_w, fig_h, canvas_h=None,
                     own_furniture=False):
-    # never compare an artist with something it contains, or with itself
+    # never compare an artist with something it contains, or with itself --
+    # which includes an Annotation's text with its own leader
+    if a.artist is b.artist:
+        return None
     if id(b.artist) in a.descendants or id(a.artist) in b.descendants:
         return None
+    for leader, other in ((a, b), (b, a)):
+        if leader.kind == 'leader' and _leader_exempt(leader, other, use_ink):
+            return None
     if id(b.artist) in getattr(a.artist, _ALLOWED_PAIRS, ()):
         return None
     # cheap reject on boxes before touching masks
@@ -1141,7 +1362,8 @@ def format_collisions(collisions, min_gap_pt=0.0, limit=None, header=True):
     if header:
         n_over = sum(1 for c in collisions if c.kind == 'overlap')
         n_close = sum(1 for c in collisions if c.kind == 'too-close')
-        n_out = len(collisions) - n_over - n_close
+        n_short = sum(1 for c in collisions if c.kind == 'short-leader')
+        n_out = len(collisions) - n_over - n_close - n_short
         if not collisions:
             return (f'Layout check: clean (no overlaps'
                     + (f', nothing closer than {min_gap_pt:g} pt)'
@@ -1151,6 +1373,8 @@ def format_collisions(collisions, min_gap_pt=0.0, limit=None, header=True):
             parts.append(f'{n_close} pair(s) closer than {min_gap_pt:g} pt')
         if n_out:
             parts.append(f'{n_out} artist(s) off-canvas or clipped')
+        if n_short:
+            parts.append(f'{n_short} leader(s) too short for their shrink')
         lines.append('Layout check: ' + ', '.join(parts))
     shown = collisions if limit is None else collisions[:limit]
     for i, c in enumerate(shown, start=1):
@@ -1211,3 +1435,355 @@ def save_collision_overlay(fig, collisions, path, color='#e1261c', dpi=150,
         for artist in added:
             artist.remove()
     return path
+
+
+# ---------------------------------------------------------------------------
+# Clipped data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClippedData:
+    """One artist drawn partly outside its axes' view limits.
+
+    ``axis`` is ``'y'``, ``'x'`` or ``'both'``; ``low`` and ``high`` are the
+    extreme data values that fall outside, and ``lim_low``/``lim_high`` the
+    limits they escape.  A side that is not exceeded is ``None``.
+    """
+
+    axes_label: str
+    artist: object
+    kind: str
+    n_points: int
+    axis: str
+    low: float = None
+    high: float = None
+    lim_low: float = 0.0
+    lim_high: float = 0.0
+
+NO_CLIP_CHECK = '_spl_no_clip_check'
+"""Attribute name set on artists that :func:`find_clipped_data` skips."""
+
+
+def exempt_from_clip_check(artist):
+    """Mark *artist* so :func:`find_clipped_data` ignores it.
+
+    Use for data you mean to run past the axes: a reference line drawn to the
+    edge, a distribution whose tail is deliberately cut, an inset's backdrop.
+    """
+    setattr(artist, NO_CLIP_CHECK, True)
+    return artist
+
+
+def _clip_candidate_points(artist):
+    """Data-space vertices of *artist*, or ``None`` if it holds no data."""
+    import matplotlib.collections as mcoll
+    from matplotlib.lines import Line2D
+
+    if isinstance(artist, Line2D):
+        return np.asarray(artist.get_xydata(), dtype=float)
+    if isinstance(artist, mcoll.LineCollection):
+        segs = artist.get_segments()
+        return np.concatenate(segs).astype(float) if len(segs) else None
+    if isinstance(artist, mcoll.PathCollection):
+        off = np.asarray(artist.get_offsets(), dtype=float)
+        return off if off.size else None
+    return None
+
+
+def find_clipped_data(fig, axes=None, tol_frac=0.002, include_insets=True):
+    """Find data drawn outside the view limits of its own axes.
+
+    Matplotlib clips to the axes by default, so a point past ``ylim`` simply
+    vanishes: no warning, no marker, nothing in the saved file.  That is easy
+    to miss when limits are hard-coded and the data later changes — a mouse
+    with a higher lick rate, an extra session — and the reader is shown a
+    truncated distribution.  This walks every axes and reports it.
+
+    Only artists drawn in data coordinates are considered, so axis labels,
+    legends, panel letters, ``axhline``/``axvline`` and anything anchored to
+    ``transAxes`` are ignored: none of them can be clipped by the view limits.
+    Patches are skipped as well, because ``axvspan`` and bar charts are
+    routinely drawn to the edge on purpose.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The composed figure.
+    axes : dict of {label: Axes}, optional
+        Report findings against these panel labels.  Defaults to every axes on
+        *fig*, labelled by index.
+    tol_frac : float
+        Ignore excursions smaller than this fraction of the axis range; a
+        marker sitting exactly on the limit is not a finding.
+    include_insets : bool
+        Also check each axes' child (inset) axes.
+
+    Returns
+    -------
+    list of :class:`ClippedData`
+        Sorted worst-first by how far the data escapes, as a fraction of the
+        axis range.  Empty when nothing is cut off.
+
+    Example::
+
+        fig, axes = composer.compose()
+        ...
+        for f in splcollide.find_clipped_data(fig, axes):
+            print(f.axes_label, f.n_points, f.high, f.lim_high)
+    """
+    if axes is None:
+        axes = {str(i): ax for i, ax in enumerate(fig.axes)}
+
+    findings = []
+    for label, ax in axes.items():
+        targets = [ax]
+        if include_insets:
+            targets += list(getattr(ax, 'child_axes', None) or [])
+        for sub in targets:
+            x0, x1 = sorted(sub.get_xlim())
+            y0, y1 = sorted(sub.get_ylim())
+            if not np.isfinite([x0, x1, y0, y1]).all():
+                continue
+            xtol, ytol = (x1 - x0) * tol_frac, (y1 - y0) * tol_frac
+            for art in sub.get_children():
+                if not art.get_visible() or getattr(art, NO_CLIP_CHECK, False):
+                    continue
+                if getattr(art, NO_COLLISION_CHECK, False):
+                    continue
+                # only data-space artists can be clipped by the view limits
+                if art.get_transform() is not sub.transData:
+                    continue
+                pts = _clip_candidate_points(art)
+                if pts is None or pts.size == 0:
+                    continue
+                pts = pts[np.isfinite(pts).all(axis=1)]
+                if pts.size == 0:
+                    continue
+                xs, ys = pts[:, 0], pts[:, 1]
+                below, above = ys < y0 - ytol, ys > y1 + ytol
+                left, right = xs < x0 - xtol, xs > x1 + xtol
+                n = int((below | above | left | right).sum())
+                if not n:
+                    continue
+                yclip, xclip = bool(below.any() or above.any()), bool(left.any() or right.any())
+                axis = 'both' if (yclip and xclip) else ('y' if yclip else 'x')
+                if axis == 'x':
+                    low, high, lo_lim, hi_lim = (xs.min() if left.any() else None,
+                                                 xs.max() if right.any() else None, x0, x1)
+                else:
+                    low, high, lo_lim, hi_lim = (ys.min() if below.any() else None,
+                                                 ys.max() if above.any() else None, y0, y1)
+                findings.append(ClippedData(
+                    axes_label=label, artist=art, kind=type(art).__name__,
+                    n_points=n, axis=axis, low=low, high=high,
+                    lim_low=lo_lim, lim_high=hi_lim))
+
+    def _severity(f):
+        span = (f.lim_high - f.lim_low) or 1.0
+        out = 0.0
+        if f.high is not None:
+            out = max(out, (f.high - f.lim_high) / span)
+        if f.low is not None:
+            out = max(out, (f.lim_low - f.low) / span)
+        return out
+
+    findings.sort(key=_severity, reverse=True)
+    return findings
+
+
+def format_clipped_data(findings, limit=None, header=True):
+    """Render :func:`find_clipped_data` output as a printable report."""
+    lines = []
+    if header:
+        lines.append('Clipping check: clean (no data outside its axes)' if not findings
+                     else 'Clipping check: %d artist(s) with data outside the axes' % len(findings))
+    for f in findings[:limit]:
+        bits = []
+        if f.high is not None:
+            bits.append('up to %.4g past %s max %.4g' % (f.high, f.axis, f.lim_high))
+        if f.low is not None:
+            bits.append('down to %.4g past %s min %.4g' % (f.low, f.axis, f.lim_low))
+        lines.append('   [%s] %s, %d point(s): %s  ->  widen %slim'
+                     % (f.axes_label, f.kind, f.n_points, '; '.join(bits), f.axis))
+    if findings and limit is not None and len(findings) > limit:
+        lines.append('   ... and %d more' % (len(findings) - limit))
+    return '\n'.join(lines)
+
+
+def check_clipping(fig, axes=None, verbose=True, limit=None, **kwargs):
+    """Find and (by default) print data drawn outside its axes.
+
+    Thin wrapper over :func:`find_clipped_data` mirroring :func:`check_layout`.
+    """
+    findings = find_clipped_data(fig, axes=axes, **kwargs)
+    if verbose:
+        print(format_clipped_data(findings, limit=limit))
+    return findings
+
+
+@dataclass
+class CrowdedData:
+    """Data drawn inside its axes but pressed up against one of the limits.
+
+    ``clearance_pt`` is the gap between the artist's painted edge (marker
+    radius and line width included) and the view limit, in points.  It goes
+    negative when the ink actually crosses the limit.
+    """
+
+    axes_label: str
+    artist: object
+    kind: str
+    n_points: int
+    edge: str
+    clearance_pt: float = 0.0
+    margin_pt: float = 0.0
+
+
+def _ink_radius_pt(artist):
+    """Half-extent of *artist*'s ink around a data point, in points.
+
+    A marker centred a point from the axis still paints over it, so crowding is
+    judged from the painted edge rather than the data coordinate.
+    """
+    import matplotlib.collections as mcoll
+    from matplotlib.lines import Line2D
+
+    if isinstance(artist, Line2D):
+        marker = artist.get_marker()
+        if marker in (None, 'None', 'none', '', ' '):
+            return float(artist.get_linewidth()) / 2.0
+        return float(artist.get_markersize()) / 2.0
+    if isinstance(artist, mcoll.PathCollection):
+        sizes = np.atleast_1d(artist.get_sizes())
+        # scatter sizes are an area in points squared
+        return float(np.sqrt(np.max(sizes))) / 2.0 if sizes.size else 0.0
+    if isinstance(artist, mcoll.LineCollection):
+        lws = np.atleast_1d(artist.get_linewidth())
+        return float(np.max(lws)) / 2.0 if lws.size else 0.0
+    return 0.0
+
+
+def find_crowded_data(fig, axes=None, margin_pt=2.0, include_insets=True,
+                      edges=('bottom', 'top')):
+    """Find data that sits inside its axes but crushed against a view limit.
+
+    The companion to :func:`find_clipped_data`.  Clipping is a defect — the
+    data is gone.  Crowding is a legibility problem: the point is drawn, but
+    its marker collides with the spine, so a value near zero reads as sitting
+    *on* the axis and its error bar is unreadable.  The usual fix is to let the
+    view extend past the data and clip the spine back with
+    ``ax.spines['left'].set_bounds(...)``, which keeps the axis reading from
+    zero while giving the data room.
+
+    Points already outside the limits are ignored; :func:`find_clipped_data`
+    reports those.  Artists exempted with :func:`exempt_from_clip_check` are
+    skipped here too, since both checks concern data meant to reach the edge.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The composed figure.
+    axes : dict of {label: Axes}, optional
+        Report findings against these panel labels.  Defaults to every axes on
+        *fig*, labelled by index.
+    margin_pt : float
+        Report ink that comes within this many points of a limit.  The default
+        of 2 pt is about one marker radius at this library's usual sizes.
+    include_insets : bool
+        Also check each axes' child (inset) axes.
+    edges : sequence of {'bottom', 'top', 'left', 'right'}
+        Which limits to check.  The y edges only, by default: a trace drawn
+        across the full x range touches ``left`` and ``right`` by construction,
+        so checking them reports every timecourse in the figure.  Crowding is
+        an x-axis problem only when the limits were chosen independently of the
+        data, so ask for those edges explicitly when that is the case.
+
+    Returns
+    -------
+    list of :class:`CrowdedData`
+        Sorted worst-first by clearance.  Empty when nothing is crowded.
+    """
+    edges = tuple(edges)
+    unknown = set(edges) - {'bottom', 'top', 'left', 'right'}
+    if unknown:
+        raise ValueError('unknown edge(s): %s' % ', '.join(sorted(unknown)))
+    if axes is None:
+        axes = {str(i): ax for i, ax in enumerate(fig.axes)}
+
+    px_per_pt = fig.dpi / 72.0
+    findings = []
+    for label, ax in axes.items():
+        targets = [ax]
+        if include_insets:
+            targets += list(getattr(ax, 'child_axes', None) or [])
+        for sub in targets:
+            x0, x1 = sorted(sub.get_xlim())
+            y0, y1 = sorted(sub.get_ylim())
+            if not np.isfinite([x0, x1, y0, y1]).all():
+                continue
+            (dx0, dy0) = sub.transData.transform((x0, y0))
+            (dx1, dy1) = sub.transData.transform((x1, y1))
+            if not np.isfinite([dx0, dy0, dx1, dy1]).all() or dx1 <= dx0 or dy1 <= dy0:
+                continue
+            for art in sub.get_children():
+                if not art.get_visible() or getattr(art, NO_CLIP_CHECK, False):
+                    continue
+                if getattr(art, NO_COLLISION_CHECK, False):
+                    continue
+                if art.get_transform() is not sub.transData:
+                    continue
+                pts = _clip_candidate_points(art)
+                if pts is None or pts.size == 0:
+                    continue
+                pts = pts[np.isfinite(pts).all(axis=1)]
+                if pts.size == 0:
+                    continue
+                disp = sub.transData.transform(pts)
+                disp = disp[np.isfinite(disp).all(axis=1)]
+                if disp.size == 0:
+                    continue
+                inside = ((disp[:, 0] >= dx0) & (disp[:, 0] <= dx1)
+                          & (disp[:, 1] >= dy0) & (disp[:, 1] <= dy1))
+                d = disp[inside]
+                if d.size == 0:
+                    continue
+                r_px = _ink_radius_pt(art) * px_per_pt
+                gaps = {'bottom': d[:, 1] - dy0, 'top': dy1 - d[:, 1],
+                        'left': d[:, 0] - dx0, 'right': dx1 - d[:, 0]}
+                for edge in edges:
+                    clear_pt = (gaps[edge] - r_px) / px_per_pt
+                    hit = clear_pt < margin_pt
+                    n = int(hit.sum())
+                    if not n:
+                        continue
+                    findings.append(CrowdedData(
+                        axes_label=label, artist=art, kind=type(art).__name__,
+                        n_points=n, edge=edge, clearance_pt=float(clear_pt.min()),
+                        margin_pt=margin_pt))
+
+    findings.sort(key=lambda f: f.clearance_pt)
+    return findings
+
+
+def format_crowded_data(findings, limit=None, header=True):
+    """Render :func:`find_crowded_data` output as a printable report."""
+    lines = []
+    if header:
+        lines.append('Crowding check: clean (no data pressed against its axes)' if not findings
+                     else 'Crowding check: %d artist(s) with data against a limit' % len(findings))
+    for f in findings[:limit]:
+        axis = 'ylim' if f.edge in ('bottom', 'top') else 'xlim'
+        lines.append('   [%s] %s, %d point(s) at the %s edge: %.1f pt clearance  ->  '
+                     'extend %s past the data and set_bounds the spine back'
+                     % (f.axes_label, f.kind, f.n_points, f.edge, f.clearance_pt, axis))
+    if findings and limit is not None and len(findings) > limit:
+        lines.append('   ... and %d more' % (len(findings) - limit))
+    return '\n'.join(lines)
+
+
+def check_crowding(fig, axes=None, verbose=True, limit=None, **kwargs):
+    """Find and (by default) print data pressed against its axes limits."""
+    findings = find_crowded_data(fig, axes=axes, **kwargs)
+    if verbose:
+        print(format_crowded_data(findings, limit=limit))
+    return findings

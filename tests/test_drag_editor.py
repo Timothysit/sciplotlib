@@ -401,3 +401,99 @@ def test_launch_editor_forwards_panel_and_snap_flags(tmp_path, monkeypatch):
     de.launch_editor(fig)
     assert '--no-panels' not in seen['cmd']
     assert '--no-snap' not in seen['cmd']
+
+
+def test_an_inset_axes_keeps_a_typed_position():
+    """The locator must not silently re-pin an inset after a numeric edit.
+
+    Only a mouse drag used to detach it, so typing a position or nudging with
+    the arrow keys appeared to do nothing at all.
+    """
+    import matplotlib.pyplot as plt
+    from sciplotlib.drag_editor import _AxesItem
+
+    fig, ax = plt.subplots()
+    inset = ax.inset_axes([0.1, 0.1, 0.2, 0.2])
+    assert inset.get_axes_locator() is not None      # pinned to the parent
+    item = _AxesItem(inset)
+
+    item._set_bounds([0.5, 0.6, 0.3, 0.25])
+    fig.canvas.draw()                                # the locator would fire here
+    pos = inset.get_position()
+    assert (pos.x0, pos.y0) == pytest.approx((0.5, 0.6), abs=1e-6)
+    assert (pos.width, pos.height) == pytest.approx((0.3, 0.25), abs=1e-6)
+    plt.close(fig)
+
+
+def test_nudging_an_inset_axes_moves_it():
+    import matplotlib.pyplot as plt
+    from sciplotlib.drag_editor import _AxesItem
+
+    fig, ax = plt.subplots()
+    inset = ax.inset_axes([0.1, 0.1, 0.2, 0.2])
+    item = _AxesItem(inset)
+    before = item.pos().copy()
+    item.nudge(20, 12)
+    fig.canvas.draw()
+    assert item.pos()[0] > before[0]
+    assert item.pos()[1] > before[1]
+    plt.close(fig)
+
+
+# ── arrow-only annotations ─────────────────────────────────────────────────
+
+def test_arrow_annotation_is_labelled_and_hit_testable():
+    """`annotate('', ...)` draws an arrow with no text.
+
+    Its Text extent is a zero-size point at the anchor, so without unioning the
+    arrow patch in it cannot be clicked where it is drawn — which made it
+    impossible to select, and so impossible to delete.
+    """
+    import matplotlib.pyplot as plt
+    from sciplotlib.drag_editor import collect_items
+
+    fig, ax = plt.subplots()
+    ax.set_axis_off()
+    ax.annotate('', xy=(0.8, 0.5), xytext=(0.2, 0.5),
+                xycoords=ax.transAxes, textcoords=ax.transAxes,
+                arrowprops=dict(arrowstyle='-|>', lw=2))
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    items = [it for it in collect_items(fig) if it.label == 'Arrow']
+    assert len(items) == 1, 'the arrow should be collected and named'
+    box = items[0].bbox_display(renderer)
+    assert box is not None and box.width > 10 and box.height > 0
+    plt.close(fig)
+
+
+def test_hiding_an_arrow_annotation_hides_it():
+    import matplotlib.pyplot as plt
+    from sciplotlib.drag_editor import collect_items
+
+    fig, ax = plt.subplots()
+    ax.annotate('', xy=(0.8, 0.5), xytext=(0.2, 0.5),
+                xycoords=ax.transAxes, textcoords=ax.transAxes,
+                arrowprops=dict(arrowstyle='-|>', lw=2))
+    item = next(it for it in collect_items(fig) if it.label == 'Arrow')
+    item.set_hidden(True)
+    assert item.hidden and item.deleted and item.moved
+    assert item.override_entry('text')['deleted'] is True
+    plt.close(fig)
+
+
+def test_dragging_an_arrow_moves_head_and_tail_together():
+    """Moving an arrow must translate it, not stretch it."""
+    import matplotlib.pyplot as plt
+    from sciplotlib.drag_editor import _get_pos, _set_pos
+
+    fig, ax = plt.subplots()
+    ann = ax.annotate('', xy=(0.8, 0.5), xytext=(0.2, 0.5),
+                      xycoords=ax.transAxes, textcoords=ax.transAxes,
+                      arrowprops=dict(arrowstyle='-|>'))
+    head0 = tuple(ann.xy)
+    _set_pos(ann, _get_pos(ann) + np.array([0.1, 0.05]))
+    assert tuple(round(v, 6) for v in ann.get_position()) == (0.3, 0.55)
+    assert tuple(round(v, 6) for v in ann.xy) == (round(head0[0] + 0.1, 6),
+                                                  round(head0[1] + 0.05, 6))
+    plt.close(fig)

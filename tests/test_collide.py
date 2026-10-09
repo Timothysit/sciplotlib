@@ -6,6 +6,8 @@ The cases here are the ones that distinguish ink-based checking from
 bounding-box checking, plus the two classes of artist that lie about their
 geometry (culled tick labels, tick/axis labels under ``axis('off')``).
 """
+import pytest
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -307,6 +309,180 @@ def test_suggestion_is_local_not_bounding_box():
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Annotations: the text and its leader are checked as two things
+# ---------------------------------------------------------------------------
+
+def _marker_figure():
+    """A marker at (0.5, 0.5) with a grey line leaving it to the right."""
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.plot([0.5, 0.9], [0.5, 0.1], color='0.78', lw=0.5)
+    ax.plot([0.5], [0.5], linestyle='none', marker='x', markersize=6,
+            markeredgewidth=1.2, color='C0')
+    return fig, ax
+
+
+def test_leader_reaching_its_marker_is_not_blamed_on_the_text():
+    """The +0.76 case: the glyphs are clear, only the leader meets its target."""
+    fig, ax = _marker_figure()
+    ann = ax.annotate('+0.76', xy=(0.5, 0.5), xytext=(0.3, 0.5),
+                      ha='right', va='center', fontsize=8,
+                      arrowprops=dict(arrowstyle='-', shrinkA=1.5, shrinkB=0))
+    cols = splcollide.find_collisions(fig, min_gap_pt=1.0)
+    assert not involving(cols, ann), [str(c) for c in cols]
+    plt.close(fig)
+
+
+def test_annotation_text_over_a_line_is_still_reported():
+    fig, ax = _marker_figure()
+    ann = ax.annotate('over the line', xy=(0.2, 0.2), xytext=(0.62, 0.34),
+                      ha='center', va='center', fontsize=8,
+                      arrowprops=dict(arrowstyle='-'))
+    hits = involving(splcollide.find_collisions(fig, min_gap_pt=0.0), ann)
+    assert hits and hits[0].kind == 'overlap', [str(c) for c in hits]
+    assert hits[0].a_desc.startswith('text'), str(hits[0])
+    plt.close(fig)
+
+
+def test_leader_crossing_another_label_is_reported_as_a_leader():
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    other = ax.text(0.5, 0.5, 'in the way', ha='center', va='center', fontsize=9)
+    ann = ax.annotate('source', xy=(0.9, 0.5), xytext=(0.1, 0.5),
+                      ha='center', va='center', fontsize=9,
+                      arrowprops=dict(arrowstyle='->'))
+    hits = involving(splcollide.find_collisions(fig, min_gap_pt=0.0), other)
+    assert hits, 'a leader drawn through a label must be reported'
+    assert any('leader of "source"' in (c.a_desc + c.b_desc) for c in hits), \
+        [str(c) for c in hits]
+    assert all(c.a is ann or c.b is ann for c in hits)
+    plt.close(fig)
+
+
+def test_leader_touching_its_artist_target_is_exempt():
+    """Like the cross-panel link: an empty-text arrow pointing AT a label."""
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.7, 0.5, 'target label', ha='center', va='center', fontsize=9)
+    link = ax.annotate('', xy=(0.0, 0.5), xycoords=target,
+                       xytext=(0.1, 0.5), textcoords='axes fraction',
+                       arrowprops=dict(arrowstyle='-|>', shrinkA=0, shrinkB=0))
+    cols = splcollide.find_collisions(fig, min_gap_pt=1.0)
+    assert not involving(cols, link), [str(c) for c in cols]
+    plt.close(fig)
+
+
+def test_leader_touching_text_at_its_target_point_is_exempt():
+    """Same, but targeted by coordinates rather than by the artist."""
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.text(0.7, 0.5, 'x', ha='center', va='center', fontsize=9)
+    link = ax.annotate('from here', xy=(0.7, 0.5), xytext=(0.2, 0.5),
+                       ha='center', va='center', fontsize=9,
+                       arrowprops=dict(arrowstyle='-', shrinkA=2, shrinkB=0))
+    cols = splcollide.find_collisions(fig, min_gap_pt=1.0)
+    assert not involving(cols, link), [str(c) for c in cols]
+    plt.close(fig)
+
+
+def test_leader_too_short_for_its_shrink_is_reported():
+    """matplotlib silently drops shrinkB when the path is shorter than
+    shrinkA + shrinkB, and draws the leader right onto its target."""
+    fig, ax = _marker_figure()
+    short = ax.annotate('+0.76', xy=(0.5, 0.5), xytext=(0.49, 0.5),
+                        ha='right', va='center', fontsize=8,
+                        arrowprops=dict(arrowstyle='-', shrinkA=1.5, shrinkB=5))
+    long = ax.annotate('fine', xy=(0.5, 0.5), xytext=(0.5, 0.9),
+                       ha='center', va='center', fontsize=8,
+                       arrowprops=dict(arrowstyle='-', shrinkA=1.5, shrinkB=5))
+    cols = splcollide.find_collisions(fig, min_gap_pt=1.0)
+    hits = [c for c in cols if c.kind == 'short-leader']
+    assert [c.a for c in hits] == [short], [str(c) for c in cols]
+    assert 'shrinkB' in str(hits[0])
+    assert not involving(cols, long), [str(c) for c in cols]
+    header = splcollide.format_collisions(hits).splitlines()[0]
+    assert '1 leader(s) too short' in header and 'clipped' not in header, header
+    plt.close(fig)
+
+
+def test_exempting_an_annotation_exempts_its_leader():
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.text(0.5, 0.5, 'in the way', ha='center', va='center', fontsize=9)
+    ann = ax.annotate('source', xy=(0.9, 0.5), xytext=(0.1, 0.5),
+                      ha='center', va='center', fontsize=9,
+                      arrowprops=dict(arrowstyle='->'))
+    splcollide.exempt_from_collision_check(ann)
+    assert not involving(splcollide.find_collisions(fig), ann)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Composer: the check's findings have to survive a batch render
+# ---------------------------------------------------------------------------
+
+def _composer_with_line():
+    composer = splcompose.FigureComposer(width_cm=8, height_cm=6, grid_rows=4,
+                                         grid_cols=4, dpi=100)
+    composer.add_panel('a', row=0, col=0, rowspan=4, colspan=4)
+    fig, axes = composer.compose()
+    ax = axes['a']
+    ax.plot([0, 1], [0.5, 0.5], color='black', lw=2)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    return composer, ax
+
+
+def test_composer_figure_ignores_autolayout():
+    """A stylesheet's figure.autolayout must not re-lay-out composed axes --
+    including after a tight-bbox save, which is what to_image() does: savefig
+    swaps the engine out and 'restores' it, and restoring a figure that had
+    none re-reads figure.autolayout and installs tight_layout after all."""
+    import io
+    import warnings
+    from matplotlib.layout_engine import TightLayoutEngine
+    with plt.rc_context({'figure.autolayout': True}):
+        composer, ax = _composer_with_line()
+        composer.fig.savefig(io.BytesIO(), format='png', bbox_inches='tight')
+        assert not isinstance(composer.fig.get_layout_engine(), TightLayoutEngine)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            composer.fig.canvas.draw()
+        plt.close(composer.fig)
+
+
+def test_save_writes_layout_report_and_overlay(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+    out = Path(tmp_path or tempfile.mkdtemp())
+    composer, ax = _composer_with_line()
+    ax.text(0.2, 0.49, 'on the line', fontsize=8)
+    composer.save(out / 'fig', formats=('png',))
+    report = (out / 'fig-layout.txt').read_text()
+    assert '1 overlap' in report and 'on the line' in report, report
+    assert (out / 'fig-layout.png').exists()
+    assert len(composer.layout_findings) == 1
+    plt.close(composer.fig)
+
+
+def test_clean_save_says_so_and_removes_a_stale_overlay(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+    out = Path(tmp_path or tempfile.mkdtemp())
+    (out / 'fig-layout.png').write_bytes(b'stale')
+    composer, ax = _composer_with_line()
+    composer.save(out / 'fig', formats=('png',))
+    assert 'clean' in (out / 'fig-layout.txt').read_text()
+    assert not (out / 'fig-layout.png').exists(), \
+        'an overlay from an earlier, dirty save would contradict the report'
+    assert composer.layout_findings == []
+    plt.close(composer.fig)
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -319,3 +495,151 @@ if __name__ == '__main__':
                 print(f'FAIL {name}: {exc}')
     print(f'\n{failures} failure(s)')
     raise SystemExit(1 if failures else 0)
+
+
+# ---------------------------------------------------------------------------
+# find_clipped_data
+# ---------------------------------------------------------------------------
+
+def _clip_fig():
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    ax.set_ylim(0, 1)
+    ax.set_xlim(0, 1)
+    return fig, ax
+
+
+def test_find_clipped_data_reports_points_above_ylim():
+    from sciplotlib.collide import find_clipped_data
+    fig, ax = _clip_fig()
+    ax.plot([0.1, 0.5, 0.9], [0.2, 1.4, 0.3])      # middle point is off the top
+    found = find_clipped_data(fig, {'a': ax})
+    assert len(found) == 1
+    assert found[0].axes_label == 'a'
+    assert found[0].axis == 'y'
+    assert found[0].n_points == 1
+    assert found[0].high == pytest.approx(1.4)
+    assert found[0].low is None
+
+
+def test_find_clipped_data_clean_when_inside():
+    from sciplotlib.collide import find_clipped_data
+    fig, ax = _clip_fig()
+    ax.plot([0.1, 0.5, 0.9], [0.2, 0.8, 0.3])
+    assert find_clipped_data(fig, {'a': ax}) == []
+
+
+def test_find_clipped_data_ignores_axes_anchored_artists():
+    """A label pinned to transAxes cannot be clipped by the view limits."""
+    from sciplotlib.collide import find_clipped_data
+    fig, ax = _clip_fig()
+    ax.plot([0.1, 0.9], [0.2, 0.3])
+    ax.text(0.5, 1.5, 'title-ish', transform=ax.transAxes)
+    ax.axhline(0.5)
+    assert find_clipped_data(fig, {'a': ax}) == []
+
+
+def test_find_clipped_data_respects_exemption():
+    from sciplotlib.collide import find_clipped_data, exempt_from_clip_check
+    fig, ax = _clip_fig()
+    line, = ax.plot([0.1, 0.5], [0.2, 9.0])
+    exempt_from_clip_check(line)
+    assert find_clipped_data(fig, {'a': ax}) == []
+
+
+def test_find_clipped_data_tolerance_ignores_points_on_the_limit():
+    from sciplotlib.collide import find_clipped_data
+    fig, ax = _clip_fig()
+    ax.plot([0.1, 0.5], [0.2, 1.0])                # exactly on ylim
+    assert find_clipped_data(fig, {'a': ax}) == []
+
+
+def test_find_clipped_data_sorts_worst_first():
+    from sciplotlib.collide import find_clipped_data
+    fig, ax = _clip_fig()
+    ax.plot([0.1, 0.2], [0.5, 1.1])                # just over
+    ax.plot([0.3, 0.4], [0.5, 3.0])                # far over
+    found = find_clipped_data(fig, {'a': ax})
+    assert [f.high for f in found] == [pytest.approx(3.0), pytest.approx(1.1)]
+
+
+# ---------------------------------------------------------------------------
+# find_crowded_data
+# ---------------------------------------------------------------------------
+
+def test_find_crowded_data_flags_marker_against_the_spine():
+    """A point just above ylim=0 paints over the axis: inside, but unreadable."""
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    ax.plot([0.5], [0.001], marker='o', ms=6)
+    found = find_crowded_data(fig, {'a': ax})
+    assert [f.edge for f in found] == ['bottom']
+    assert found[0].n_points == 1
+    assert found[0].clearance_pt < 0            # ink crosses the limit
+
+
+def test_find_crowded_data_clean_with_room_below():
+    """The set_bounds fix: view drops below zero, so the marker has clearance."""
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    ax.set_ylim(-0.1, 1)
+    ax.spines['left'].set_bounds(0, 1)
+    ax.plot([0.5], [0.001], marker='o', ms=6)
+    assert find_crowded_data(fig, {'a': ax}) == []
+
+
+def test_find_crowded_data_ignores_already_clipped_points():
+    """Points outside the view belong to find_clipped_data, not here."""
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    ax.plot([0.5], [1.6], marker='o', ms=6)
+    assert find_crowded_data(fig, {'a': ax}) == []
+
+
+def test_find_crowded_data_accounts_for_marker_size():
+    """The same coordinate is fine small and crowded large."""
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    small, = ax.plot([0.3], [0.02], marker='o', ms=1)
+    assert find_crowded_data(fig, {'a': ax}) == []
+    small.set_markersize(40)
+    assert len(find_crowded_data(fig, {'a': ax})) == 1
+
+
+def test_find_crowded_data_respects_the_clip_exemption():
+    from sciplotlib.collide import find_crowded_data, exempt_from_clip_check
+    fig, ax = _clip_fig()
+    line, = ax.plot([0.5], [0.001], marker='o', ms=6)
+    exempt_from_clip_check(line)
+    assert find_crowded_data(fig, {'a': ax}) == []
+
+
+def test_find_crowded_data_sorts_worst_first():
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    ax.plot([0.2], [0.02], marker='o', ms=6)     # almost on the axis
+    ax.plot([0.4], [0.12], marker='o', ms=6)     # nearby, but not as close
+    found = [f for f in find_crowded_data(fig, {'a': ax}, margin_pt=40)
+             if f.edge == 'bottom']
+    assert len(found) == 2
+    assert found[0].clearance_pt < found[1].clearance_pt
+
+
+def test_find_crowded_data_ignores_x_edges_by_default():
+    """A trace spanning the full x range touches both x limits by construction."""
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    ax.plot(np.linspace(0, 1, 50), np.full(50, 0.5))
+    assert find_crowded_data(fig, {'a': ax}) == []
+    widened = find_crowded_data(fig, {'a': ax},
+                                edges=('bottom', 'top', 'left', 'right'))
+    assert {f.edge for f in widened} == {'left', 'right'}
+
+
+def test_find_crowded_data_rejects_an_unknown_edge():
+    from sciplotlib.collide import find_crowded_data
+    fig, ax = _clip_fig()
+    with pytest.raises(ValueError, match='unknown edge'):
+        find_crowded_data(fig, {'a': ax}, edges=('bottom', 'middle'))

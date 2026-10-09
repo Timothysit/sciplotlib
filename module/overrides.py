@@ -281,6 +281,14 @@ def resolve(fig, address, fingerprint=None):
 
 def apply_value(kind, target, value, entry=None):
     entry = entry or {}
+    if entry.get('deleted'):
+        # Deletion is stored as a flag on an ordinary entry rather than as its
+        # own kind, so an address that is deleted still carries the position it
+        # had -- un-ticking Delete in the editor restores it without having to
+        # remember where it was. Hidden, not removed: the artist has to stay in
+        # the figure for the address to keep resolving on the next run.
+        target.set_visible(False)
+        return
     if kind == 'xlabel':
         target.xaxis.set_label_coords(float(value[0]), float(value[1]))
     elif kind == 'ylabel':
@@ -299,6 +307,8 @@ def apply_value(kind, target, value, entry=None):
             set_image_zoom(target, entry['zoom'])
     elif kind == 'text':
         target.set_position((float(value[0]), float(value[1])))
+        if entry.get('text') is not None:      # edited string, not just moved
+            target.set_text(entry['text'])
     else:
         raise ValueError(f'unknown kind: {kind}')
 
@@ -414,9 +424,60 @@ def overrides_as_code(overrides, axes_var='axes'):
             lines.append(f'# text {fp!r}')
             lines.append(
                 f'{ax}.texts[{i}].set_position(({val[0]:.4f}, {val[1]:.4f}))')
+            if entry.get('text') is not None:
+                lines.append(f'{ax}.texts[{i}].set_text({entry["text"]!r})')
         else:
             lines.append(f'# (unknown kind {kind!r}: {val})')
     return '\n'.join(lines)
+
+
+def check_child_overrides(fig, path, verbose=True, min_overlap=0.5):
+    """Warn about ``axes`` overrides that no longer sit on their panel.
+
+    An ``axes`` entry (an inset, a colorbar) is stored in **absolute figure
+    coordinates**, unlike a ``panel`` (a delta against the fitted layout) or a
+    ``text`` (the panel's own data coordinates). So it is the one kind that
+    does *not* follow its panel: move that panel to another grid cell, or
+    change the grid or figure size, and the child stays where the drag left it
+    while the panel travels off without it.
+
+    Nothing else notices — the figure renders happily with the inset stranded
+    in the wrong place, which on a dense poster is easy to miss until print.
+    This turns that silent failure into a message.
+
+    Call **after** the layout is final (after ``fit_axes_to_cells`` has replayed
+    the deferred panel deltas); before that the panels are not where they will
+    end up and every child would look misplaced.
+
+    Returns a list of warning strings.
+    """
+    warnings = []
+    for address, entry in read_overrides(path).items():
+        if entry.get('kind') != 'axes' or '/' not in address:
+            continue
+        parent_address = address.split('/', 1)[0]
+        _, child, _ = resolve(fig, address, fingerprint=entry.get('fingerprint'))
+        _, parent, _ = resolve(fig, parent_address)
+        if child is None or parent is None:
+            continue
+        pbox, cbox = parent.get_position(), child.get_position()
+        area = cbox.width * cbox.height
+        if area <= 0:
+            continue
+        overlap = (max(0.0, min(pbox.x1, cbox.x1) - max(pbox.x0, cbox.x0))
+                   * max(0.0, min(pbox.y1, cbox.y1) - max(pbox.y0, cbox.y0)))
+        if overlap / area >= min_overlap:
+            continue
+        warnings.append(
+            f'{address}: now sits {(1 - overlap / area) * 100:.0f}% outside '
+            f'panel {parent_address[len("panel:"):]!r}. An "axes" override is '
+            f'stored in absolute figure coordinates, so it does not follow its '
+            f'panel when the layout changes. Re-drag it in the editor, or move '
+            f'the change into the plotting code and delete this entry.')
+    if verbose:
+        for w in warnings:
+            print(f'[overrides] WARNING {w}')
+    return warnings
 
 
 def apply_overrides(fig, path, verbose=True, kinds=None, skip_kinds=None):

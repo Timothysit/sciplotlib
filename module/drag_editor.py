@@ -71,6 +71,7 @@ import sys
 import pickle
 import numpy as np
 
+from matplotlib.transforms import Bbox
 from matplotlib.text import Text
 from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
@@ -170,6 +171,21 @@ def _get_pos(artist) -> np.ndarray:
 
 def _set_pos(artist, pos):
     if isinstance(artist, Text):
+        # An arrow-only annotation is positioned by its TAIL (xytext) while its
+        # head is pinned at `xy`, so setting the position alone stretches the
+        # arrow instead of moving it. Carry the head along by the same delta.
+        arrow = getattr(artist, 'arrow_patch', None)
+        # matplotlib stores the text's coordinate system as `anncoords`, not
+        # `textcoords` (that name is only the constructor argument). Only carry
+        # the head along when both ends are in the SAME system -- otherwise the
+        # delta is in the wrong units.
+        _xyc = getattr(artist, 'xycoords', None)
+        _txc = getattr(artist, 'anncoords', getattr(artist, 'textcoords', None))
+        if arrow is not None and (_xyc is _txc or _xyc == _txc):
+            old = np.asarray(artist.get_position(), dtype=float)
+            delta = np.asarray(pos, dtype=float) - old
+            if artist.xy is not None:
+                artist.xy = tuple(np.asarray(artist.xy, dtype=float) + delta)
         artist.set_position(tuple(pos))
     elif isinstance(artist, AnnotationBbox):
         artist.xy = tuple(pos)
@@ -241,6 +257,8 @@ def _artist_label(artist, role='text') -> str:
         return f'y-axis label "{artist.get_text()}"'
     if isinstance(artist, Text):
         txt = artist.get_text().replace('\n', '\\n')
+        if not txt and getattr(artist, 'arrow_patch', None) is not None:
+            return 'Arrow'          # annotate('', ...): an arrow, no text
         return f'Text("{txt}")'
     if isinstance(artist, AnnotationBbox):
         return 'Image overlay'
@@ -285,10 +303,47 @@ class _Item:
         self._initial_zoom = (_overrides.image_zoom(artist)
                               if self.is_image else None)
         self._zoom_changed = False
+        # Editable text content (headings, labels). Only free-text artists have
+        # a meaningful string; images and patches do not.
+        self.is_text = isinstance(artist, Text) and not self.is_image
+        self._initial_text = artist.get_text() if self.is_text else None
+        self._text_history: list[str] = []   # strings before each edit
+        self._initially_visible = artist.get_visible()
+
+    @property
+    def hidden(self) -> bool:
+        return not self.artist.get_visible()
+
+    @property
+    def deleted(self) -> bool:
+        """Hidden by the editor, as opposed to hidden by the figure itself."""
+        return self._initially_visible and self.hidden
+
+    def set_hidden(self, hidden: bool):
+        self.artist.set_visible(not hidden)
 
     @property
     def moved(self) -> bool:
-        return bool(self._history) or self._zoom_changed
+        return (bool(self._history) or self._zoom_changed
+                or self.text_changed or self.deleted)
+
+    @property
+    def text_changed(self) -> bool:
+        return self.is_text and self.artist.get_text() != self._initial_text
+
+    def set_text(self, new_text: str):
+        """Replace the artist's string, recording the old one for undo/reset."""
+        if not self.is_text:
+            return False
+        self._text_history.append(self.artist.get_text())
+        self.artist.set_text(new_text)
+        return True
+
+    def undo_text(self) -> bool:
+        if self._text_history:
+            self.artist.set_text(self._text_history.pop())
+            return True
+        return False
 
     def _tf(self):
         if self._explicit_transform is not None:
@@ -308,6 +363,18 @@ class _Item:
         except Exception:
             pass
         self._pinned = True
+
+    def record(self):
+        """Snapshot the current position onto the undo stack.
+
+        A drag does this in :meth:`start`. An edit that jumps straight to a new
+        value — typing into the position fields — has to do it itself: both
+        Undo and Save decide what changed purely from this history, so without
+        it the edit applies on screen and is then silently dropped.
+        """
+        if self.role in ('xlabel', 'ylabel') and not self._pinned:
+            self._pin_axis_label()
+        self._history.append(_get_pos(self.artist).copy())
 
     def start(self, ex: float, ey: float, event=None):
         if self.role in ('xlabel', 'ylabel') and not self._pinned:
@@ -362,14 +429,33 @@ class _Item:
         _set_pos(self.artist, self._initial_pos)
         if self.is_image and self._initial_zoom is not None:
             _overrides.set_image_zoom(self.artist, self._initial_zoom)
+        if self.is_text and self._initial_text is not None:
+            self.artist.set_text(self._initial_text)
         self._history.clear()
+        self._text_history.clear()
         self._zoom_changed = False
+        self.set_hidden(not self._initially_visible)
 
     def pos(self) -> np.ndarray:
         return _get_pos(self.artist)
 
     def bbox_display(self, renderer):
-        return _get_window_extent(self.artist, renderer)
+        box = _get_window_extent(self.artist, renderer)
+        arrow = getattr(self.artist, 'arrow_patch', None)
+        if arrow is not None:
+            # `annotate('', ...)` draws an arrow with no text, so the Text
+            # extent is a zero-size point at the anchor and the artist is
+            # unclickable where it is actually drawn. Union in the arrow so the
+            # box covers the thing on screen.
+            try:
+                a_box = arrow.get_window_extent(renderer)
+            except Exception:
+                a_box = None
+            if a_box is not None and a_box.width and a_box.height:
+                box = (Bbox.union([box, a_box])
+                       if box is not None and box.width and box.height
+                       else a_box)
+        return box
 
     def coord_system(self) -> str:
         return _transform_name(self.artist, self.ax, self._explicit_transform)
@@ -378,10 +464,14 @@ class _Item:
         entry = {'kind': kind,
                  'value': [float(v) for v in self.pos()],
                  'fingerprint': getattr(self, 'override_fingerprint', None)}
+        if self.deleted:
+            entry['deleted'] = True
         if kind == 'image':
             z = _overrides.image_zoom(self.artist)
             if z is not None:
                 entry['zoom'] = z
+        if kind == 'text' and self.text_changed:
+            entry['text'] = self.artist.get_text()
         return entry
 
     def code_snippet(self) -> str:
@@ -395,10 +485,11 @@ class _Item:
             return (f'# {self.label}\n'
                     f'ax.yaxis.set_label_coords({x:.4f}, {y:.4f})')
         if isinstance(a, Text):
-            return (
-                f'# {self.label}  [{cs}]\n'
-                f'.set_position(({x:.4f}, {y:.4f}))'
-            )
+            lines = [f'# {self.label}  [{cs}]',
+                     f'.set_position(({x:.4f}, {y:.4f}))']
+            if self.text_changed:
+                lines.append(f'.set_text({a.get_text()!r})')
+            return '\n'.join(lines)
         if isinstance(a, AnnotationBbox):
             zoom = _overrides.image_zoom(a)
             lines = [f'# {self.label}  [{cs}]', f'.xy = ({x:.4f}, {y:.4f})']
@@ -453,10 +544,11 @@ class _AxesItem:
         base = getattr(ax, '_sciplotlib_panel_base', None) if role == 'panel' else None
         self._initial_bounds = np.array(
             base if base is not None else ax.get_position().bounds, dtype=float)
+        self._initially_visible = ax.get_visible()
 
     @property
     def moved(self) -> bool:
-        return len(self._history) > 0
+        return len(self._history) > 0 or self.deleted
 
     # -- internals ----------------------------------------------------------
 
@@ -468,7 +560,15 @@ class _AxesItem:
             self.ax.set_axes_locator(None)
 
     def _set_bounds(self, bounds, move_children=True):
-        """Apply *bounds*, translating un-pinned children by the same offset."""
+        """Apply *bounds*, translating un-pinned children by the same offset.
+
+        Detaches the locator first. A drag does that in :meth:`start`, but the
+        numeric position fields, the arrow keys and :meth:`scale` all come
+        straight here — and on an inset axes the locator re-pins it on the next
+        redraw, so the edit silently vanished with no error and no visible
+        change, which reads as an editor that ignores what you type.
+        """
+        self._detach_locator()
         x0, y0, w, h = bounds
         w = max(float(w), MIN_SIZE)
         h = max(float(h), MIN_SIZE)
@@ -484,6 +584,12 @@ class _AxesItem:
                                     cpos.width, cpos.height])
 
     # -- interaction --------------------------------------------------------
+
+    def record(self):
+        """Snapshot the current bounds onto the undo stack. See `_Item.record`."""
+        self._detach_locator()
+        self._history.append(
+            np.array(self.ax.get_position().bounds, dtype=float))
 
     def start(self, ex: float, ey: float, event=None):
         self._detach_locator()
@@ -553,6 +659,18 @@ class _AxesItem:
     def reset(self):
         self._set_bounds(self._initial_bounds)
         self._history.clear()
+        self.set_hidden(not self._initially_visible)
+
+    @property
+    def hidden(self) -> bool:
+        return not self.ax.get_visible()
+
+    @property
+    def deleted(self) -> bool:
+        return self._initially_visible and self.hidden
+
+    def set_hidden(self, hidden: bool):
+        self.ax.set_visible(not hidden)
 
     def pos(self) -> np.ndarray:
         return np.array(self.ax.get_position().bounds, dtype=float)
@@ -571,6 +689,8 @@ class _AxesItem:
                  'fingerprint': None}
         if kind == 'panel':
             entry['delta'] = [float(v) for v in self.delta()]
+        if self.deleted:
+            entry['deleted'] = True
         return entry
 
     def code_snippet(self) -> str:

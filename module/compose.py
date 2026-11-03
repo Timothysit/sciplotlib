@@ -768,7 +768,7 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
                             label_font_size=14, label_weight='bold',
                             label_x=0.0, label_y=0.01, label_ha='left',
                             wspace=None, hspace=None, margins=None,
-                            axes_pad=None):
+                            axes_pad=None, label_case=None):
     """Render a list of panel dicts onto a matplotlib figure.
 
     Parameters
@@ -798,6 +798,10 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
         decorations (tick labels, axis labels). Keys 'left', 'right',
         'top', 'bottom' in figure-fraction units. The panel label is
         placed at the cell boundary, and the axes is shrunk inward.
+    label_case : {None, 'upper', 'lower'}
+        Change the case of the drawn panel label only. The panel key (used
+        to index the returned axes dict and overrides) is left as given, so
+        a figure keyed 'a', 'b', ... can be drawn with 'A', 'B', ... labels.
 
     Returns
     -------
@@ -858,9 +862,15 @@ def render_panels_to_figure(panels, grid_rows, grid_cols, fig,
             p_ly = p.get('label_y')
             lx = label_x if p_lx is None else p_lx
             ly = label_y if p_ly is None else p_ly
-            fig.text(pos.x0 + lx, pos.y1 + ly, label,
-                     fontsize=label_font_size, fontweight=label_weight,
-                     va='bottom', ha=label_ha)
+            shown = (label.upper() if label_case == 'upper'
+                     else label.lower() if label_case == 'lower' else label)
+            label_text = fig.text(pos.x0 + lx, pos.y1 + ly, shown,
+                                  fontsize=label_font_size, fontweight=label_weight,
+                                  va='bottom', ha=label_ha)
+            # Remember which panel this letter belongs to, so code that hides
+            # or finds letters does not depend on the drawn (possibly re-cased)
+            # text matching the panel key.
+            label_text._sciplotlib_panel_key = label
 
         ax.tick_params(bottom=False, left=False, labelbottom=False, labelleft=False)
 
@@ -1020,7 +1030,8 @@ class FigureComposer:
 
     def __init__(self, width_cm=18, height_cm=24, grid_rows=24, grid_cols=20,
                  label_font_size=14, label_weight='bold',
-                 label_x=0.0, label_y=0.01, label_ha='left', dpi=300,
+                 label_x=0.0, label_y=0.01, label_ha='left', label_case=None,
+                 dpi=300,
                  stylesheet=None, rc_params=None,
                  font_size=None, axis_label_font_size=None, title_font_size=None,
                  margins=None, axes_pad=None,
@@ -1036,6 +1047,7 @@ class FigureComposer:
         self.label_x = label_x
         self.label_y = label_y
         self.label_ha = label_ha
+        self.label_case = label_case
         self.dpi = dpi
         self.stylesheet = stylesheet
         self.rc_params = rc_params or {}
@@ -1471,7 +1483,7 @@ class FigureComposer:
             # belong to other panels; optionally hide the target panel's own letter.
             all_labels = {p.get('label', '') for p in self.panels if p.get('label')}
             for text_obj in fig.texts:
-                txt = text_obj.get_text()
+                txt = getattr(text_obj, '_sciplotlib_panel_key', text_obj.get_text())
                 if txt in all_labels:
                     if txt != label:
                         text_obj.set_visible(False)
@@ -1533,6 +1545,7 @@ class FigureComposer:
             wspace=wspace, hspace=hspace,
             margins=self.margins,
             axes_pad=self.axes_pad,
+            label_case=self.label_case,
         )
 
         # Call plot_func for panels that provide one
@@ -2186,7 +2199,8 @@ class FigureComposer:
                 if lbl != label:
                     ax.set_visible(False)
             for text_obj in fig.texts:
-                if text_obj.get_text() in all_labels - {label}:
+                key = getattr(text_obj, '_sciplotlib_panel_key', text_obj.get_text())
+                if key in all_labels - {label}:
                     text_obj.set_visible(False)
 
             # ── Step 3: compute tight bbox in display (pixel) coordinates ───────
